@@ -133,6 +133,13 @@ class WorkflowTest(unittest.TestCase):
                     (bugs[0]["id"],),
                 ),
             )
+            self.assertEqual(
+                0,
+                storage.scalar(
+                    "SELECT COUNT(*) FROM artifacts WHERE run_id=? AND kind='playwright_trace'",
+                    (run_id,),
+                ),
+            )
 
             root_attempts = int(pages[0]["attempts"])
             first_round = storage.latest_round(run_id)
@@ -174,6 +181,23 @@ class WorkflowTest(unittest.TestCase):
             )
             self.assertEqual(2, storage.scalar("SELECT COUNT(*) FROM run_rounds WHERE run_id=?", (run_id,)))
 
+            screenshot = storage.rows(
+                "SELECT * FROM artifacts WHERE run_id=? AND kind='screenshot' ORDER BY id LIMIT 1",
+                (run_id,),
+            )[0]
+            legacy_path = (
+                Path("D:/LegacyWebQA/webqa-output/runs")
+                / run_id
+                / "screenshots"
+                / Path(screenshot["path"]).name
+            )
+            legacy_artifact_id = storage.add_artifact(
+                run_id,
+                "legacy_screenshot",
+                str(legacy_path),
+                page_id=int(screenshot["page_id"]),
+            )
+
             md_path, html_path = Reporter(storage, run_id, config, run_dir).write()
             self.assertTrue(md_path.exists())
             self.assertTrue(html_path.exists())
@@ -190,6 +214,13 @@ class WorkflowTest(unittest.TestCase):
             self.assertIn("Menu child", report)
             self.assertIn("Grandchild", report)
             self.assertIn("等待更深轮次解锁：1", report)
+            self.assertNotIn("D:/LegacyWebQA/", report)
+            self.assertIn(f"(screenshots/{Path(screenshot['path']).name})", report)
+            migrated = storage.rows(
+                "SELECT path FROM artifacts WHERE id=?",
+                (legacy_artifact_id,),
+            )[0]
+            Path(migrated["path"]).resolve().relative_to(run_dir.resolve())
             storage.close_thread_connection()
 
     def test_running_items_are_recovered_for_resume(self):

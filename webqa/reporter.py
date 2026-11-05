@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .safety import Redactor
 from .storage import Storage
 from .utils import canonical_url, json_load, now_iso, path_label, same_host
 
@@ -216,6 +217,8 @@ class Reporter:
         self.run_id = run_id
         self.config = config
         self.output_dir = output_dir
+        self.redactor = Redactor(config.get("safety") or {})
+        self.storage.rebase_output_references(config["output"]["directory"])
 
     def final_actions(self) -> list[dict]:
         rows = self.storage.rows(
@@ -251,6 +254,52 @@ class Reporter:
             "unique_controls": self.storage.scalar("SELECT COUNT(*) FROM frontier WHERE run_id=?", (self.run_id,)),
             "links": max(int(visited_links or 0), recorded_same_host_links),
         }
+
+    def _artifact_reference(self, artifact: dict) -> tuple[str | None, str]:
+        """Return a portable link contained by the current run directory."""
+        run_root = self.output_dir.resolve()
+        raw = Path(artifact["path"])
+        label = raw.name or "未命名证据"
+        candidate = (run_root / raw).resolve() if not raw.is_absolute() else raw.resolve()
+        try:
+            relative = candidate.relative_to(run_root)
+        except ValueError:
+            parts = list(raw.parts)
+            try:
+                run_index = next(index for index, part in enumerate(parts) if part == self.run_id)
+            except StopIteration:
+                return None, label
+            candidate = run_root.joinpath(*parts[run_index + 1 :]).resolve()
+            try:
+                relative = candidate.relative_to(run_root)
+            except ValueError:
+                return None, label
+        if not candidate.exists():
+            return None, label
+        kind = str(artifact.get("kind") or "")
+        try:
+            if kind == "pagepatrol_json":
+                content = json.loads(candidate.read_text(encoding="utf-8"))
+                candidate.write_text(
+                    json.dumps(self.redactor.redact_value(content), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            elif kind == "pagepatrol_html":
+                candidate.write_text(
+                    self.redactor.redact_text(candidate.read_text(encoding="utf-8", errors="replace")),
+                    encoding="utf-8",
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            self.storage.add_message(
+                self.run_id,
+                "warning",
+                "redaction",
+                self.redactor.redact_text(f"证据 {label} 脱敏失败：{type(exc).__name__}: {exc}"),
+            )
+        normalized = str(candidate)
+        if normalized != artifact["path"]:
+            self.storage.update_artifact_path(int(artifact["id"]), normalized)
+        return relative.as_posix(), label
 
     def build_markdown(self) -> str:
         run = self.storage.run(self.run_id)
@@ -496,15 +545,19 @@ class Reporter:
         if artifacts:
             md.extend(["", "## 本地证据", ""])
             for artifact in artifacts:
-                link = Path(artifact["path"]).resolve().as_posix()
-                md.append(f"- {artifact['kind']}（页面 {artifact.get('page_id') or '-'}）：[{Path(link).name}]({link})")
+                link, label = self._artifact_reference(artifact)
+                prefix = f"- {artifact['kind']}（页面 {artifact.get('page_id') or '-'}）"
+                if link:
+                    md.append(f"{prefix}：[{label}]({link})")
+                else:
+                    md.append(f"{prefix}：`{label}`（文件缺失或不属于当前运行目录）")
         warnings = [message for message in messages if message["level"] in {"warning", "error"}]
         if warnings:
             md.extend(["", "## 运行消息", ""])
             for message in warnings:
                 md.append(f"- [{message['level']}] {message['message']}")
         md.append("")
-        return "\n".join(md)
+        return self.redactor.redact_text("\n".join(md))
 
     def write(self) -> tuple[Path, Path]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -525,7 +578,7 @@ class Reporter:
                 {
                     "schema_version": 2,
                     "run_id": self.run_id,
-                    "target": summary["run"]["target"],
+                    "target": self.redactor.redact_url(summary["run"]["target"]),
                     "started_at": summary["run"]["created_at"],
                     "updated_at": summary["run"]["updated_at"],
                     "completed_at": summary["run"].get("completed_at"),
@@ -566,7 +619,7 @@ class Reporter:
                 f"[Markdown]({(relative / md_name).as_posix()}) / [HTML]({(relative / html_name).as_posix()}) / "
                 f"[Manifest]({(relative / 'run-manifest.json').as_posix()}) |"
             )
-        markdown = "\n".join(lines) + "\n"
+        markdown = self.redactor.redact_text("\n".join(lines) + "\n")
         md_path = archive_root / "运行归档索引.md"
         html_path = archive_root / "运行归档索引.html"
         md_path.write_text(markdown, encoding="utf-8")

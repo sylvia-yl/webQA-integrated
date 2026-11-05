@@ -6,6 +6,7 @@ htmlcov/
 
 .venv/
 venv/
+.playwright-browsers/
 
 webqa-output/
 test-results/

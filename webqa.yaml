@@ -31,6 +31,26 @@ exclude:
 
 language: zh-CN
 
+safety:
+  # 保存、提交、发送、登录等持久化动作必须显式开启。
+  allow_stateful_actions: false
+  # 删除、支付、发布等高影响动作除开启外，还必须从 prohibited 中移除对应禁词。
+  allow_destructive_actions: false
+  # 未知按钮只执行一次；结果不确定时不会自动重试。
+  allow_unknown_actions: true
+  redaction_enabled: true
+  redact_emails: true
+  redact_phone_numbers: true
+  sensitive_keys: []
+  mask_form_fields_in_screenshots: true
+  capture_screenshots: true
+  # Trace 可能包含完整 DOM 和网络上下文，默认关闭。
+  capture_traces: false
+  # URL 带令牌等敏感参数时，默认不把页面交给外部视觉审计工具。
+  allow_sensitive_pagepatrol: false
+  # 启动 URL 含敏感参数时默认拒绝运行，避免明文写入断点数据库。
+  allow_sensitive_target_storage: false
+
 traversal:
   # 同一深度全部完成后，才开始下一层。
   strategy: layered

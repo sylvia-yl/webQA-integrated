@@ -3,7 +3,14 @@ WebQA 使用说明
 
 一、启动测试
 
-双击：D:\ThreeProjects\webQA\启动WebQA.cmd
+首次运行先在 PowerShell 中执行：
+
+cd D:\ThreeProjects\webQA-integrated
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+
+之后双击：D:\ThreeProjects\webQA-integrated\启动WebQA.cmd
 
 按照窗口提示输入：
 
@@ -30,7 +37,7 @@ WebQA 使用说明
 
 运行窗口会持续显示当前层、页面数、状态数、控件队列、链接数和最新动作。
 
-也可以双击：D:\ThreeProjects\webQA\查看WebQA状态.cmd
+也可以双击：D:\ThreeProjects\webQA-integrated\查看WebQA状态.cmd
 
 直接按 Enter 查看最近实例；也可以输入指定的运行 ID。
 
@@ -43,7 +50,7 @@ WebQA 使用说明
 
 每次测试单独归档到：
 
-D:\ThreeProjects\webQA\webqa-output\runs\<开始时间-实例ID>\
+D:\ThreeProjects\webQA-integrated\webqa-output\runs\<开始时间-实例ID>\
 
 主要文件：
 
@@ -53,7 +60,7 @@ D:\ThreeProjects\webQA\webqa-output\runs\<开始时间-实例ID>\
 - 报告和 manifest 中的“运行轮次与深度接续”：记录每轮深度变化及从历史结果提升的页面数。
 - live-status.md/json：运行步骤和当前状态。
 - screenshots：页面状态截图。
-- traces：缺陷复现轨迹。
+- traces：缺陷复现轨迹；默认关闭，只有显式启用 `safety.capture_traces` 才生成。
 - pagepatrol：PagePatrol 原始报告。
 
 四、刚才的网址如何测试主页
@@ -65,3 +72,12 @@ D:\ThreeProjects\webQA\webqa-output\runs\<开始时间-实例ID>\
 这会完整测试 /zh 页面本身的可见控件和页面内状态，但不会进入任何子页面。
 
 之后若要继续第一层，再次输入同一网址，层数输入 1，运行方式输入 R。
+
+五、安全默认值
+
+- 子页面策略默认是 record_only：只记录候选链接，达到解锁深度后才作为独立页面测试。
+- 保存、提交、发送、登录等持久化动作默认不执行。
+- 删除、支付、发布等高影响动作默认不执行，并继续受 prohibited 禁词约束。
+- 截图默认遮盖输入框、文本域和可编辑区域。
+- URL、日志、报告和 PagePatrol 文本结果默认脱敏。
+- 动作已经触发但结果不确定时标记为 UNKNOWN_COMMIT，不自动重试。

@@ -6,6 +6,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .safety import Redactor
+
 
 DEFAULTS: dict = {
     "version": 1,
@@ -21,6 +23,20 @@ DEFAULTS: dict = {
     "prohibited": ["payment", "delete", "publish", "oauth"],
     "exclude": ["ai_answer_quality"],
     "language": "zh-CN",
+    "safety": {
+        "allow_stateful_actions": False,
+        "allow_destructive_actions": False,
+        "allow_unknown_actions": True,
+        "redaction_enabled": True,
+        "redact_emails": True,
+        "redact_phone_numbers": True,
+        "sensitive_keys": [],
+        "mask_form_fields_in_screenshots": True,
+        "capture_screenshots": True,
+        "capture_traces": False,
+        "allow_sensitive_pagepatrol": False,
+        "allow_sensitive_target_storage": False,
+    },
     "traversal": {
         "strategy": "layered",
         "parallel_pages": 3,
@@ -65,19 +81,29 @@ def _merge(base: dict, override: dict) -> dict:
 
 def load_config(path: str | Path) -> tuple[dict, Path]:
     config_path = Path(path).resolve()
+    project_root = config_path.parent
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     config = _merge(DEFAULTS, raw)
     validate_config(config)
     output = config["output"]
     output_dir = Path(output["directory"])
     if not output_dir.is_absolute():
-        output_dir = config_path.parent / output_dir
+        output_dir = project_root / output_dir
     output_dir = output_dir.resolve()
+    try:
+        output_dir.relative_to(project_root)
+    except ValueError as exc:
+        raise ValueError(f"output.directory 必须位于项目目录内：{project_root}") from exc
     output["directory"] = str(output_dir)
     database = Path(output["database"])
     if not database.is_absolute():
         database = output_dir / database
-    output["database"] = str(database.resolve())
+    database = database.resolve()
+    try:
+        database.relative_to(output_dir)
+    except ValueError as exc:
+        raise ValueError(f"output.database 必须位于输出目录内：{output_dir}") from exc
+    output["database"] = str(database)
     return config, config_path
 
 
@@ -96,8 +122,29 @@ def validate_config(config: dict) -> None:
         raise ValueError("traversal.parallel_pages 必须在 1 到 8 之间")
     if traversal["strategy"] != "layered":
         raise ValueError("当前版本仅支持 layered 分层遍历")
-    if traversal["child_page_check"] != "record_only":
-        raise ValueError("当前版本要求 child_page_check=record_only")
+    if traversal["child_page_check"] not in {"record_only", "load_only"}:
+        raise ValueError("traversal.child_page_check 必须是 record_only 或 load_only")
+    safety = config["safety"]
+    for key in (
+        "allow_stateful_actions",
+        "allow_destructive_actions",
+        "allow_unknown_actions",
+        "redaction_enabled",
+        "redact_emails",
+        "redact_phone_numbers",
+        "mask_form_fields_in_screenshots",
+        "capture_screenshots",
+        "capture_traces",
+        "allow_sensitive_pagepatrol",
+        "allow_sensitive_target_storage",
+    ):
+        if not isinstance(safety[key], bool):
+            raise ValueError(f"safety.{key} 必须是布尔值")
+    if Redactor(safety).redact_url(target) != target and not safety["allow_sensitive_target_storage"]:
+        raise ValueError(
+            "target 含 token、session、password 等敏感参数；默认禁止写入数据库。"
+            "请改用 storage_state，或明确设置 safety.allow_sensitive_target_storage=true"
+        )
 
 
 def apply_overrides(

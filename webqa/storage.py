@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -10,6 +12,19 @@ from typing import Iterator
 from urllib.parse import urlsplit
 
 from .utils import canonical_url, json_load, json_text, now_iso
+
+
+OUTPUT_ROOT_RE = re.compile(r"[A-Za-z]:[\\/](?:[^\\/\r\n]+[\\/])*webqa-output", re.I)
+
+
+def _rebase_output_value(value, output_root: str):
+    if isinstance(value, str):
+        return OUTPUT_ROOT_RE.sub(lambda _match: output_root, value)
+    if isinstance(value, list):
+        return [_rebase_output_value(item, output_root) for item in value]
+    if isinstance(value, dict):
+        return {key: _rebase_output_value(item, output_root) for key, item in value.items()}
+    return value
 
 
 SCHEMA = r"""
@@ -998,6 +1013,71 @@ class Storage:
                 (run_id, page_id, action_id, kind, path, json_text(metadata or {}), now_iso()),
             )
             return int(cur.lastrowid)
+
+    def update_artifact_path(self, artifact_id: int, path: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("UPDATE artifacts SET path=? WHERE id=?", (path, artifact_id))
+
+    def rebase_output_references(self, output_root: str | Path) -> int:
+        """Move persisted local references to this project's output directory."""
+        root = str(Path(output_root).resolve())
+        changed = 0
+        json_columns = {
+            "runs": ("id", ["config_json"]),
+            "frontier": ("id", ["path_json", "result_json"]),
+            "actions": ("id", ["full_path_json", "evidence_json"]),
+            "artifacts": ("id", ["metadata_json"]),
+            "bugs": ("id", ["shortest_path_json", "first_evidence_json"]),
+            "reproductions": ("id", ["evidence_json"]),
+            "business_rules": ("id", ["evidence_json"]),
+            "messages": ("id", ["data_json"]),
+        }
+        with self.transaction() as conn:
+            for table, (key, columns) in json_columns.items():
+                selected = ",".join([key, *columns])
+                for row in conn.execute(f"SELECT {selected} FROM {table}").fetchall():
+                    updates: dict[str, str] = {}
+                    for column in columns:
+                        raw = row[column]
+                        if not raw or "webqa-output" not in raw.lower():
+                            continue
+                        try:
+                            value = json.loads(raw)
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        rebased = _rebase_output_value(value, root)
+                        encoded = json_text(rebased)
+                        if encoded != raw:
+                            updates[column] = encoded
+                    if updates:
+                        assignments = ",".join(f"{column}=?" for column in updates)
+                        conn.execute(
+                            f"UPDATE {table} SET {assignments} WHERE {key}=?",
+                            (*updates.values(), row[key]),
+                        )
+                        changed += len(updates)
+            for table, key, columns in (
+                ("artifacts", "id", ["path"]),
+                ("reproductions", "id", ["trace_path", "screenshot_path"]),
+            ):
+                selected = ",".join([key, *columns])
+                for row in conn.execute(f"SELECT {selected} FROM {table}").fetchall():
+                    updates = {}
+                    for column in columns:
+                        raw = row[column]
+                        if not raw:
+                            continue
+                        rebased = OUTPUT_ROOT_RE.sub(lambda _match: root, raw)
+                        if rebased != raw:
+                            updates[column] = rebased
+                    if updates:
+                        assignments = ",".join(f"{column}=?" for column in updates)
+                        conn.execute(
+                            f"UPDATE {table} SET {assignments} WHERE {key}=?",
+                            (*updates.values(), row[key]),
+                        )
+                        changed += len(updates)
+        return changed
 
     def add_test_cases(
         self,

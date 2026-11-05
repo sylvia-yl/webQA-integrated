@@ -7,6 +7,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from .safety import Redactor
 from .storage import Storage
 from .utils import canonical_url, json_load, now_iso, path_label, same_host
 
@@ -30,6 +31,8 @@ class ProgressTracker:
 
     def snapshot(self) -> dict:
         run = self.storage.run(self.run_id)
+        config = json_load(run.get("config_json"), {})
+        redactor = Redactor(config.get("safety") or {})
         page_rows = self.storage.rows(
             "SELECT depth,status,COUNT(*) n FROM page_nodes WHERE run_id=? GROUP BY depth,status ORDER BY depth,status",
             (self.run_id,),
@@ -66,7 +69,7 @@ class ProgressTracker:
         pages_by_depth: dict[str, dict[str, int]] = {}
         for row in page_rows:
             pages_by_depth.setdefault(str(row["depth"]), {})[row["status"]] = int(row["n"])
-        return {
+        return redactor.redact_value({
             "generated_at": now_iso(),
             "run_id": self.run_id,
             "target": run["target"],
@@ -95,7 +98,7 @@ class ProgressTracker:
                 for row in latest_actions
             ],
             "latest_messages": latest_messages,
-        }
+        })
 
     @staticmethod
     def one_line(snapshot: dict) -> str:

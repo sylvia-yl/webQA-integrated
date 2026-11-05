@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import traceback
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -9,44 +10,32 @@ from urllib.parse import urlsplit
 from .browser import action_step, locate_control, observable_delta, snapshot
 from .pagepatrol import run_pagepatrol
 from .planner_rules import plan_field_cases
+from .safety import (
+    ActionRisk,
+    Redactor,
+    classify_action,
+    classify_exception,
+    decide_recovery,
+)
 from .storage import Storage
 from .utils import canonical_url, json_load, same_host, sha
 
 
-FIXED_RISK_WORDS = [
-    "delete",
-    "remove",
-    "destroy",
-    "erase",
-    "pay",
-    "purchase",
-    "checkout",
-    "place order",
-    "publish",
-    "deploy",
-    "oauth",
-    "withdraw",
-    "transfer",
-    "删除",
-    "移除",
-    "支付",
-    "购买",
-    "结算",
-    "发布",
-    "部署",
-    "提现",
-    "转账",
-]
+class ActionAttemptError(RuntimeError):
+    def __init__(self, cause: BaseException):
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.cause = cause
 
 
 class EventLog:
-    def __init__(self, page):
+    def __init__(self, page, redactor: Redactor):
         self.console_errors: list[str] = []
         self.page_errors: list[str] = []
         self.failed_requests: list[str] = []
         self.responses: list[dict] = []
         self.response_errors: list[str] = []
         self.page = page
+        self.redactor = redactor
         self._callbacks = {
             "console": self._console,
             "pageerror": self._page_error,
@@ -86,13 +75,13 @@ class EventLog:
                 pass
 
     def evidence(self) -> dict:
-        return {
+        return self.redactor.redact_value({
             "console_errors": self.console_errors[:10],
             "page_errors": self.page_errors[:10],
             "failed_requests": self.failed_requests[:10],
             "document_responses": self.responses[-10:],
             "response_errors": self.response_errors[:10],
-        }
+        })
 
     def clear(self) -> None:
         self.console_errors.clear()
@@ -125,9 +114,10 @@ class PageExplorer:
         self.host = (urlsplit(self.target).hostname or "").lower()
         self.scope = config["scope"]
         self.settings = config["traversal"]
-        configured = [str(x) for x in config.get("prohibited") or []]
-        words = sorted(set(FIXED_RISK_WORDS + configured), key=len, reverse=True)
-        self.risk_re = re.compile("|".join(re.escape(word) for word in words), re.I)
+        self.safety = config.get("safety") or {}
+        self.redactor = Redactor(self.safety)
+        self._current_action_attempted = False
+        self._current_risk: ActionRisk | None = None
 
     def _context(self, browser):
         args = {
@@ -156,10 +146,38 @@ class PageExplorer:
 
     def _open(self, context, url: str):
         page = context.new_page()
-        log = EventLog(page)
+        log = EventLog(page, self.redactor)
         response = page.goto(url, wait_until="domcontentloaded", timeout=int(self.settings["navigation_timeout_ms"]))
         self._settle(page)
         return page, response, log
+
+    def _snapshot(self, page) -> tuple[dict, list[dict]]:
+        snap, controls = snapshot(page, self.target, int(self.settings["max_controls_per_state"]))
+        return self.redactor.redact_value(snap), self.redactor.redact_value(controls)
+
+    def _write_screenshot(self, page, path: Path) -> bool:
+        if not self.safety.get("capture_screenshots", True):
+            return False
+        options = {
+            "path": str(path),
+            "full_page": True,
+            "animations": "disabled",
+            "timeout": 30000,
+        }
+        if self.safety.get("mask_form_fields_in_screenshots", True):
+            options["mask"] = [
+                page.locator("input,textarea,[contenteditable='true'],[data-sensitive],[data-private]")
+            ]
+            options["mask_color"] = "#111111"
+        page.screenshot(**options)
+        return True
+
+    def _attempt_click(self, locator) -> None:
+        self._current_action_attempted = True
+        try:
+            locator.click(timeout=int(self.settings["action_timeout_ms"]))
+        except Exception as exc:
+            raise ActionAttemptError(exc) from exc
 
     def _replay(self, page, action_path: list[dict]) -> None:
         for step in action_path:
@@ -176,14 +194,14 @@ class PageExplorer:
         screen_dir.mkdir(parents=True, exist_ok=True)
         path = screen_dir / f"page-{page_id:04d}-state-{state_id:05d}-{fingerprint[:8]}.png"
         try:
-            page.screenshot(path=str(path), full_page=True, animations="disabled", timeout=30000)
-            self.storage.add_artifact(self.run_id, "screenshot", str(path), page_id=page_id, metadata={"state_id": state_id})
+            if self._write_screenshot(page, path):
+                self.storage.add_artifact(self.run_id, "screenshot", str(path), page_id=page_id, metadata={"state_id": state_id})
         except Exception as exc:
             self.storage.add_message(
                 self.run_id,
                 "warning",
                 "screenshot",
-                f"页面 {page_id} 状态 {state_id} 截图失败：{exc}",
+                self.redactor.redact_text(f"页面 {page_id} 状态 {state_id} 截图失败：{exc}"),
             )
 
     def _register_state(
@@ -194,7 +212,7 @@ class PageExplorer:
         discovered_by_action_id: int | None,
         priority: int,
     ) -> tuple[int | None, bool, dict, list[dict], int]:
-        snap, controls = snapshot(page, self.target, int(self.settings["max_controls_per_state"]))
+        snap, controls = self._snapshot(page)
         state_id, is_new = self.storage.add_state(
             self.run_id,
             int(page_row["id"]),
@@ -222,6 +240,9 @@ class PageExplorer:
         descriptor = row["descriptor"]
         evidence = extra.pop("evidence", {})
         evidence.update(extra)
+        if self._current_risk is not None:
+            evidence.setdefault("risk", self._current_risk.to_dict())
+        evidence = self.redactor.redact_value(evidence)
         return self.storage.record_action(
             self.run_id,
             int(row["page_id"]),
@@ -230,11 +251,11 @@ class PageExplorer:
             int(row["id"]),
             status,
             action_type,
-            descriptor.get("label") or "未命名控件",
+            self.redactor.redact_text(descriptor.get("label") or "未命名控件"),
             row.get("state_fingerprint"),
             evidence.pop("after_fingerprint", None),
-            outcome,
-            row["full_path"],
+            self.redactor.redact_text(outcome),
+            self.redactor.redact_value(row["full_path"]),
             evidence,
         )
 
@@ -354,12 +375,12 @@ class PageExplorer:
         def on_page(new_page):
             if new_page is not page:
                 popups.append(new_page)
-                popup_logs.append(EventLog(new_page))
+                popup_logs.append(EventLog(new_page, self.redactor))
 
         context.on("page", on_page)
         try:
             locator.scroll_into_view_if_needed(timeout=2500)
-            locator.click(timeout=int(self.settings["action_timeout_ms"]))
+            self._attempt_click(locator)
             page.wait_for_timeout(int(self.settings["settle_ms"]))
             destination_page = popups[-1] if popups else page
             if popups:
@@ -391,14 +412,13 @@ class PageExplorer:
             f"source-{int(page_row['id']):04d}-control-{int(row['control_id']):06d}-{sha(final_url, 10)}.png"
         )
         try:
-            page.screenshot(path=str(path), full_page=True, animations="disabled", timeout=30000)
-            return str(path)
+            return str(path) if self._write_screenshot(page, path) else None
         except Exception as exc:
             self.storage.add_message(
                 self.run_id,
                 "warning",
                 "link_screenshot",
-                f"子页面加载验证截图失败：{final_url}；{exc}",
+                self.redactor.redact_text(f"子页面加载验证截图失败：{final_url}；{exc}"),
             )
             return None
 
@@ -617,14 +637,17 @@ class PageExplorer:
             int(page_row["id"]),
             action_id,
             fingerprint,
-            f"点击「{row['descriptor'].get('label') or '未命名控件'}」出现页面脚本异常",
-            row["full_path"],
-            {"page_error": expected_error},
+            self.redactor.redact_text(f"点击「{row['descriptor'].get('label') or '未命名控件'}」出现页面脚本异常"),
+            self.redactor.redact_value(row["full_path"]),
+            {"page_error": self.redactor.redact_text(expected_error)},
         )
+        capture_traces = bool(self.safety.get("capture_traces", False))
         trace_dir = self.output_dir / "traces"
         screen_dir = self.output_dir / "reproductions"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        screen_dir.mkdir(parents=True, exist_ok=True)
+        if capture_traces:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+        if self.safety.get("capture_screenshots", True):
+            screen_dir.mkdir(parents=True, exist_ok=True)
         reproduced_count = 0
         for attempt in (1, 2):
             context = self._context(browser)
@@ -633,8 +656,11 @@ class PageExplorer:
             log = None
             evidence: dict = {}
             reproduced = False
+            tracing_started = False
             try:
-                context.tracing.start(screenshots=True, snapshots=True, sources=False)
+                if capture_traces:
+                    context.tracing.start(screenshots=True, snapshots=True, sources=False)
+                    tracing_started = True
                 page, _, log = self._open(context, page_row["url"])
                 self._replay(page, row["action_path"])
                 log.clear()
@@ -649,17 +675,18 @@ class PageExplorer:
                 if not reproduced and signature:
                     reproduced = any(signature[:120] in value or value[:120] in signature for value in signatures if value)
                 evidence = log.evidence() | {"expected_signature": signature, "observed_signatures": signatures}
-                page.screenshot(path=str(screenshot_path), full_page=True, animations="disabled", timeout=30000)
+                self._write_screenshot(page, screenshot_path)
             except Exception as exc:
                 evidence = (log.evidence() if log else {}) | {
-                    "automation_error": f"{type(exc).__name__}: {exc}",
+                    "automation_error": self.redactor.redact_text(f"{type(exc).__name__}: {exc}"),
                     "expected_signature": signature,
                 }
             finally:
-                try:
-                    context.tracing.stop(path=str(trace_path))
-                except Exception as exc:
-                    evidence["trace_error"] = str(exc)
+                if tracing_started:
+                    try:
+                        context.tracing.stop(path=str(trace_path))
+                    except Exception as exc:
+                        evidence["trace_error"] = self.redactor.redact_text(str(exc))
                 if log:
                     log.detach()
                 context.close()
@@ -671,7 +698,7 @@ class PageExplorer:
                 attempt,
                 reproduced,
                 status,
-                evidence,
+                self.redactor.redact_value(evidence),
                 str(trace_path) if trace_path.exists() else None,
                 str(screenshot_path) if screenshot_path.exists() else None,
             )
@@ -703,16 +730,16 @@ class PageExplorer:
         return status, bug_id
 
     def _handle_state_action(self, browser, page, context, page_row: dict, row: dict, locator, log: EventLog) -> None:
-        before, _ = snapshot(page, self.target, int(self.settings["max_controls_per_state"]))
+        before, _ = self._snapshot(page)
         clipboard_before = ""
         try:
             clipboard_before = page.evaluate("navigator.clipboard.readText().catch(() => '')") or ""
         except Exception:
             pass
         locator.scroll_into_view_if_needed(timeout=2500)
-        locator.click(timeout=int(self.settings["action_timeout_ms"]))
+        self._attempt_click(locator)
         self._settle(page)
-        after, _ = snapshot(page, self.target, int(self.settings["max_controls_per_state"]))
+        after, _ = self._snapshot(page)
         clipboard_after = ""
         try:
             clipboard_after = page.evaluate("navigator.clipboard.readText().catch(() => '')") or ""
@@ -860,21 +887,65 @@ class PageExplorer:
                 log.page_errors[0],
             )
 
+    def _observe_after_failure(self, page, row: dict) -> dict:
+        observation = {"available": False, "state_changed": False}
+        if page is None or page.is_closed():
+            return observation
+        try:
+            snap, _ = self._snapshot(page)
+            observation.update(
+                {
+                    "available": True,
+                    "state_changed": (
+                        snap.get("fingerprint") != row.get("state_fingerprint")
+                        or canonical_url(self.target, snap.get("url") or "")
+                        != canonical_url(self.target, row.get("descriptor", {}).get("page_url") or page.url)
+                    ),
+                    "fingerprint": snap.get("fingerprint"),
+                    "url": self.redactor.redact_url(snap.get("url") or page.url),
+                    "title": self.redactor.redact_text(snap.get("title") or ""),
+                }
+            )
+        except Exception as exc:
+            observation["observation_error"] = self.redactor.redact_text(f"{type(exc).__name__}: {exc}")
+        return observation
+
     def _execute_frontier(self, browser, page_row: dict, row: dict) -> None:
-        context = self._context(browser)
+        context = None
         page = None
         log = None
+        stage = "open"
+        self._current_action_attempted = False
+        risk: ActionRisk = classify_action(
+            row["descriptor"], self.safety, self.config.get("prohibited") or []
+        )
+        self._current_risk = risk
         try:
+            context = self._context(browser)
             page, _, log = self._open(context, page_row["url"])
+            stage = "replay"
             self._replay(page, row["action_path"])
             log.clear()
+            stage = "locate"
             locator = locate_control(page, row["descriptor"])
             if not locator.is_visible(timeout=1500):
                 raise RuntimeError("控件在重放到目标状态后不可见")
             descriptor = row["descriptor"]
             if descriptor.get("disabled") or not locator.is_enabled(timeout=1000):
-                self._record_action(row, "DYNAMIC_DISABLED", "disabled", "控件在当前重放状态下处于禁用态，已记录且未强制点击")
-                self.storage.finish_frontier(int(row["id"]), "DYNAMIC_DISABLED", {"disabled": True})
+                outcome = "控件在当前重放状态下处于禁用态，已记录且未强制点击"
+                self._record_action(row, "DYNAMIC_DISABLED", "disabled", outcome, risk=risk.to_dict())
+                self.storage.finish_frontier(
+                    int(row["id"]),
+                    "DYNAMIC_DISABLED",
+                    {"disabled": True, "risk": risk.to_dict(), "outcome": outcome},
+                )
+                return
+            if not risk.allowed:
+                outcome = f"{risk.reason}；风险等级 {risk.level}，未执行"
+                self._record_action(row, "SKIPPED_RISK", "risk", outcome, risk=risk.to_dict())
+                self.storage.finish_frontier(
+                    int(row["id"]), "SKIPPED_RISK", {"risk": risk.to_dict(), "outcome": outcome}
+                )
                 return
             href = descriptor.get("href") or ""
             if href:
@@ -892,55 +963,83 @@ class PageExplorer:
                         int(row["control_id"]),
                         href,
                         "OUT_OF_SCOPE",
-                        row["full_path"],
+                        self.redactor.redact_value(row["full_path"]),
                     )
                     self.storage.finish_frontier(int(row["id"]), "OUT_OF_SCOPE", {"target": href})
                     return
                 if canonical_url(self.target, href) != canonical_url(self.target, page_row["canonical_url"]):
+                    stage = "action"
                     self._handle_known_link(page, context, page_row, row, locator, log)
                     return
-            label_and_href = f"{descriptor.get('label') or ''} {descriptor.get('href') or ''}"
-            if not href and self.risk_re.search(label_and_href):
-                self._record_action(row, "SKIPPED_RISK", "risk", "命中禁止动作策略，未执行可能产生持久副作用的操作")
-                self.storage.finish_frontier(int(row["id"]), "SKIPPED_RISK", {"matched": True})
-                return
             tag = descriptor.get("tag")
             field_type = (descriptor.get("type") or "").lower()
-            if tag in {"textarea", "select"} or (tag == "input" and field_type not in {"button", "submit", "reset", "checkbox", "radio"}):
+            if tag in {"textarea", "select"} or (
+                tag == "input" and field_type not in {"button", "submit", "reset", "checkbox", "radio"}
+            ):
+                stage = "plan"
                 self._handle_form_control(row)
                 return
+            stage = "action"
             self._handle_state_action(browser, page, context, page_row, row, locator, log)
         except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
+            original = exc.cause if isinstance(exc, ActionAttemptError) else exc
+            error_text = f"{type(original).__name__}: {original}"
             evidence = {
-                "error": error_text,
-                "traceback": traceback.format_exc(limit=5),
+                "error": self.redactor.redact_text(error_text),
+                "traceback": self.redactor.redact_text(traceback.format_exc(limit=5)),
+                "stage": stage,
+                "risk": risk.to_dict(),
             }
             if log:
                 evidence.update(log.evidence())
+            observation = self._observe_after_failure(page, row)
+            evidence["post_failure_observation"] = observation
+
+            decision_delay_ms = 0
             if "控件在重放到目标状态后不可见" in error_text:
                 action_status = "STATE_REPLAY_GAP"
                 outcome = "该控件属于先前页面状态，但重新执行点击路径后未再次出现；作为覆盖缺口记录，不判为产品缺陷"
-                self.storage.finish_frontier(int(row["id"]), action_status, evidence | {"outcome": outcome})
                 final_status = action_status
+                self.storage.finish_frontier(int(row["id"]), final_status, evidence | {"outcome": outcome})
             elif "intercepts pointer events" in error_text:
                 action_status = "NOT_ACTIONABLE"
                 outcome = "控件被当前可操作元素遮挡或属于非活动轮播项，未强制点击，不判为产品缺陷"
-                self.storage.finish_frontier(int(row["id"]), action_status, evidence | {"outcome": outcome})
                 final_status = action_status
+                self.storage.finish_frontier(int(row["id"]), final_status, evidence | {"outcome": outcome})
             elif "element is not enabled" in error_text:
                 action_status = "DYNAMIC_DISABLED"
                 outcome = "控件在执行时处于禁用态，已记录且未强制点击"
-                self.storage.finish_frontier(int(row["id"]), action_status, evidence | {"outcome": outcome})
                 final_status = action_status
+                self.storage.finish_frontier(int(row["id"]), final_status, evidence | {"outcome": outcome})
             else:
-                action_status = "UNCONFIRMED"
-                first_line = error_text.splitlines()[0][:240]
-                outcome = f"自动化执行未确认：{first_line}；不判为产品缺陷"
-                final_status = self.storage.retry_frontier(
-                    int(row["id"]), evidence | {"outcome": outcome}, int(self.settings["retry_limit"])
+                classification = classify_exception(original, evidence, stage)
+                evidence["exception_classification"] = classification.to_dict()
+                decision = decide_recovery(
+                    classification,
+                    risk,
+                    action_attempted=self._current_action_attempted,
+                    state_changed=bool(observation.get("state_changed")),
+                    attempts=int(row["attempts"]),
+                    retry_limit=int(self.settings["retry_limit"]),
                 )
-            self._record_action(row, action_status, "automation", outcome, evidence=evidence)
+                evidence["recovery_decision"] = {
+                    "status": decision.status,
+                    "retry": decision.retry,
+                    "reason": decision.reason,
+                    "delay_ms": decision.delay_ms,
+                }
+                action_status = decision.status
+                outcome = f"{classification.category}：{decision.reason}"
+                decision_delay_ms = decision.delay_ms
+                if decision.retry:
+                    final_status = self.storage.retry_frontier(
+                        int(row["id"]), evidence | {"outcome": outcome}, int(self.settings["retry_limit"])
+                    )
+                else:
+                    final_status = decision.status
+                    self.storage.finish_frontier(int(row["id"]), final_status, evidence | {"outcome": outcome})
+
+            self._record_action(row, action_status, "recovery", outcome, evidence=evidence)
             href = row["descriptor"].get("href") or ""
             if href and same_host(self.target, href):
                 target = canonical_url(self.target, href)
@@ -950,13 +1049,17 @@ class PageExplorer:
                 if visits:
                     self.storage.finish_link(
                         int(visits[0]["id"]),
-                        "RETRY" if final_status == "RETRY" else "UNCONFIRMED",
+                        final_status,
                         error=evidence["error"],
                     )
+            if decision_delay_ms:
+                time.sleep(decision_delay_ms / 1000)
         finally:
             if log:
                 log.detach()
-            context.close()
+            if context:
+                context.close()
+            self._current_risk = None
 
     def process_page(self, page_id: int) -> dict:
         if not self.storage.claim_page(page_id):
@@ -978,8 +1081,10 @@ class PageExplorer:
                     self.run_id,
                     "warning",
                     "pagepatrol",
-                    f"{page_row['url']} 的 PagePatrol 未确认：{patrol.get('error') or patrol.get('status')}",
-                    patrol,
+                    self.redactor.redact_text(
+                        f"{page_row['url']} 的 PagePatrol 未确认：{patrol.get('error') or patrol.get('status')}"
+                    ),
+                    self.redactor.redact_value(patrol),
                 )
         try:
             from playwright.sync_api import sync_playwright
@@ -988,6 +1093,7 @@ class PageExplorer:
                 browser = playwright.chromium.launch(headless=not self.headed)
                 try:
                     context = self._context(browser)
+                    log = None
                     try:
                         page, response, log = self._open(context, page_row["url"])
                         body_chars = int(page.evaluate("() => (document.body?.innerText || '').trim().length"))
@@ -998,9 +1104,9 @@ class PageExplorer:
                             raise RuntimeError("页面没有可见文本内容")
                         self.storage.update_page(
                             page_id,
-                            title=page.title(),
+                            title=self.redactor.redact_text(page.title()),
                             http_status=http_status,
-                            final_url=page.url,
+                            final_url=self.redactor.redact_url(page.url),
                             content_summary=f"可见文本 {body_chars} 字符",
                         )
                         state_id, _, _, controls, queued = self._register_state(page, page_row, [], None, 0)
@@ -1010,13 +1116,16 @@ class PageExplorer:
                             self.run_id,
                             "info",
                             "exploration",
-                            f"页面 {page_row['url']} 初始状态发现 {len(controls)} 个可见控件，入队 {queued} 个",
+                            self.redactor.redact_text(
+                                f"页面 {page_row['url']} 初始状态发现 {len(controls)} 个可见控件，入队 {queued} 个"
+                            ),
                         )
                     finally:
-                        try:
-                            log.detach()
-                        except Exception:
-                            pass
+                        if log:
+                            try:
+                                log.detach()
+                            except Exception:
+                                pass
                         try:
                             context.close()
                         except Exception:
@@ -1039,7 +1148,9 @@ class PageExplorer:
                             self.run_id,
                             "warning",
                             "coverage",
-                            f"页面 {page_row['url']} 达到动作上限，阻塞 {blocked} 个待测控件",
+                            self.redactor.redact_text(
+                                f"页面 {page_row['url']} 达到动作上限，阻塞 {blocked} 个待测控件"
+                            ),
                         )
                     self.storage.finish_page(page_id, "DONE")
                     return {"page_id": page_id, "status": "DONE", "actions": actions}
@@ -1049,12 +1160,22 @@ class PageExplorer:
             self.storage.finish_page(page_id, "RETRY", str(exc))
             return {"page_id": page_id, "status": "RETRY", "error": str(exc)}
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            next_status = (
-                "RETRY"
-                if int(page_row.get("attempts") or 0) < int(self.settings["retry_limit"])
-                else "LOAD_FAIL"
-            )
+            error = self.redactor.redact_text(f"{type(exc).__name__}: {exc}")
+            classification = classify_exception(exc, {}, "open")
+            if classification.category == "AUTH_BLOCKED":
+                next_status = "BLOCKED"
+            elif classification.retryable and int(page_row.get("attempts") or 0) < int(self.settings["retry_limit"]):
+                next_status = "RETRY"
+            else:
+                next_status = "LOAD_FAIL"
             self.storage.finish_page(page_id, next_status, error)
-            self.storage.add_message(self.run_id, "error", "page", f"页面 {page_row['url']} 处理失败：{error}")
+            self.storage.add_message(
+                self.run_id,
+                "error",
+                "page",
+                self.redactor.redact_text(
+                    f"页面 {page_row['url']} 处理失败（{classification.category}）：{error}"
+                ),
+                {"classification": classification.to_dict()},
+            )
             return {"page_id": page_id, "status": next_status, "error": error}

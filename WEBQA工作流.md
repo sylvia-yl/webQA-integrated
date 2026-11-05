@@ -19,6 +19,23 @@
 7. 外域链接和尚未解锁的下一层链接只记录路径，不点击。
 8. 每个页面、状态、控件、动作、链接、运行轮次和证据均写入 SQLite。`PENDING/RUNNING/RETRY` 可在进程中断后恢复。
 9. 自动化超时、定位失败或无可观察变化只能判为“未确认”；不能直接写成产品缺陷。
+10. 动作按 `READ_ONLY/UNKNOWN/STATEFUL/DESTRUCTIVE` 分类；持久化和高影响动作默认不执行。
+11. 只有可以证明安全重试的只读动作才会自动重试；动作已触发但结果不确定时标记为 `UNKNOWN_COMMIT`。
+12. 截图默认遮盖表单字段；URL、日志、报告和 PagePatrol 文本结果默认脱敏；Playwright trace 默认关闭。
+
+## 安全配置
+
+`webqa.yaml` 的 `safety` 段控制执行和证据边界：
+
+- `allow_stateful_actions: false`：默认禁止保存、提交、发送、登录等动作。
+- `allow_destructive_actions: false`：默认禁止删除、支付、发布等高影响动作；`prohibited` 仍具有更高优先级。
+- `allow_unknown_actions: true`：允许探索未知按钮，但不能证明安全时不会自动重试。
+- `mask_form_fields_in_screenshots: true`：截图遮盖输入框、文本域和可编辑区域。
+- `capture_traces: false`：trace 可能包含完整 DOM，默认不生成。
+- `allow_sensitive_pagepatrol: false`：带敏感参数的 URL 默认不交给外部视觉审计工具。
+- `allow_sensitive_target_storage: false`：目标 URL 含 token、session 等参数时默认拒绝运行，优先使用 `storage_state`。
+
+默认子页面策略保持 `record_only`；如需在发现链接时只验证加载，可显式改成 `load_only`。
 
 ## 深度递增续跑
 
@@ -63,7 +80,7 @@ python .\webqa_cli.py status
 python .\webqa_cli.py report
 ```
 
-如果系统 Python 没有 Playwright，入口会自动切换到 PagePatrol 虚拟环境中的 Python。数据库和所有证据只写入当前项目的 `webqa-output` 目录；旧的 `测试进度.json` 不会被覆盖或自动导入。
+入口优先使用项目内 `.venv`，其次使用 PagePatrol 虚拟环境，最后使用系统 Python。数据库和所有证据只写入当前项目的 `webqa-output` 目录；旧的 `测试进度.json` 不会被覆盖或自动导入。
 
 ## 固定目录与时间归档
 
