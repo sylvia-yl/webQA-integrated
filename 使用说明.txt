@@ -81,3 +81,5 @@ D:\ThreeProjects\webQA-integrated\webqa-output\runs\<开始时间-实例ID>\
 - 截图默认遮盖输入框、文本域和可编辑区域。
 - URL、日志、报告和 PagePatrol 文本结果默认脱敏。
 - 动作已经触发但结果不确定时标记为 UNKNOWN_COMMIT，不自动重试。
+- 页眉、页脚、全局导航及悬浮控件首次成功测试后，在同一次运行的其他页面只做可见性、可用性和实时指纹核验；一致时记录 SHARED_CONTROL_REUSED，不再次点击。
+- 页面业务区、表单提交、失败或未确认的控件不会复用；新建回归实例会全部重新测试。

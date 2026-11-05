@@ -37,6 +37,19 @@
 
 默认子页面策略保持 `record_only`；如需在发现链接时只验证加载，可显式改成 `load_only`。
 
+## 跨页面共享控件
+
+`deduplication.shared_controls` 用于页眉、页脚、全局导航以及 `fixed/sticky` 悬浮控件：
+
+1. 控件第一次出现时仍执行完整测试；只有 `TECH_PASS`、`STATE_DISCOVERED` 或 `LINK_RECORDED` 会成为可复用来源。
+2. 后续页面不会直接跳过。系统会打开页面、重放必要状态，确认控件仍可见且可用，并重新采集实时共享指纹。
+3. 共享指纹由站点、全局区域、稳定 `id/data-testid/name`、角色、标签和链接目标构成；坐标、DOM 序号和完整 selector 不参与身份判断。
+4. 完全匹配后记录 `SHARED_CONTROL_REUSED`，报告保留来源页面、控件和动作 ID，但不再次点击。
+5. 失败、未确认、禁用、属性变化、链接目标变化以及页面业务区/表单提交控件不会复用。
+6. 复用只在同一个运行 ID 内生效；`--new-run` 会重新测试，保证回归覆盖。
+
+自动识别证据不足的 AI 助手或反馈入口，可以加入 `include_selectors`；确认不应跨页复用的控件可以加入 `exclude_selectors`。默认 `min_confidence: high`，不建议为了提高命中率直接改成 `medium`。
+
 ## 深度递增续跑
 
 第一次以深度 `0` 新建实例：

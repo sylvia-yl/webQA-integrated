@@ -123,6 +123,10 @@ class SafetyTest(unittest.TestCase):
     def test_record_only_is_default_and_load_only_remains_available(self):
         config = copy.deepcopy(DEFAULTS)
         self.assertEqual("record_only", config["traversal"]["child_page_check"])
+        shared = config["deduplication"]["shared_controls"]
+        self.assertTrue(shared["enabled"])
+        self.assertEqual("verify_then_reuse", shared["policy"])
+        self.assertEqual("high", shared["min_confidence"])
         validate_config(config)
         config["traversal"]["child_page_check"] = "load_only"
         validate_config(config)

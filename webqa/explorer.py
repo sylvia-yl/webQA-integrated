@@ -18,7 +18,10 @@ from .safety import (
     decide_recovery,
 )
 from .storage import Storage
-from .utils import canonical_url, json_load, same_host, sha
+from .utils import canonical_url, json_load, json_text, same_host, sha
+
+
+REUSABLE_SHARED_STATUSES = {"TECH_PASS", "STATE_DISCOVERED", "LINK_RECORDED"}
 
 
 class ActionAttemptError(RuntimeError):
@@ -116,6 +119,33 @@ class PageExplorer:
         self.settings = config["traversal"]
         self.safety = config.get("safety") or {}
         self.redactor = Redactor(self.safety)
+        self.shared_settings = (
+            (config.get("deduplication") or {}).get("shared_controls") or {}
+        )
+        self.shared_context_key = sha(
+            json_text(
+                {
+                    "algorithm_version": 1,
+                    "host": self.host,
+                    "language": config.get("language"),
+                    "viewport": self.scope.get("viewport"),
+                    "account_mode": (config.get("accounts") or {}).get("mode"),
+                    "storage_state": (config.get("accounts") or {}).get("storage_state"),
+                    "child_page_check": self.settings.get("child_page_check"),
+                    "prohibited": config.get("prohibited") or [],
+                    "safety": {
+                        key: self.safety.get(key)
+                        for key in (
+                            "allow_stateful_actions",
+                            "allow_destructive_actions",
+                            "allow_unknown_actions",
+                        )
+                    },
+                    "shared_controls": self.shared_settings,
+                }
+            ),
+            32,
+        )
         self._current_action_attempted = False
         self._current_risk: ActionRisk | None = None
 
@@ -152,8 +182,57 @@ class PageExplorer:
         return page, response, log
 
     def _snapshot(self, page) -> tuple[dict, list[dict]]:
-        snap, controls = snapshot(page, self.target, int(self.settings["max_controls_per_state"]))
+        snap, controls = snapshot(
+            page,
+            self.target,
+            int(self.settings["max_controls_per_state"]),
+            self.shared_settings,
+        )
         return self.redactor.redact_value(snap), self.redactor.redact_value(controls)
+
+    def _shared_candidate(self, descriptor: dict) -> bool:
+        if not self.shared_settings.get("enabled", True):
+            return False
+        shared_key = str(descriptor.get("shared_control_key") or "")
+        scope = str(descriptor.get("shared_scope") or "")
+        confidence = str(descriptor.get("shared_confidence") or "none")
+        if not shared_key or scope not in set(self.shared_settings.get("scopes") or []):
+            return False
+        ranks = {"none": 0, "medium": 1, "high": 2}
+        required = str(self.shared_settings.get("min_confidence") or "high")
+        return ranks.get(confidence, 0) >= ranks.get(required, 2)
+
+    def _shared_result(self, row: dict) -> dict | None:
+        descriptor = row["descriptor"]
+        if not self._shared_candidate(descriptor):
+            return None
+        return self.storage.reusable_shared_control_result(
+            self.run_id,
+            self.shared_context_key,
+            descriptor["shared_control_key"],
+            int(row["page_id"]),
+        )
+
+    def _verified_shared_result(self, page, row: dict) -> dict | None:
+        reused = self._shared_result(row)
+        if not reused:
+            return None
+        _, controls = self._snapshot(page)
+        shared_key = row["descriptor"]["shared_control_key"]
+        current = next(
+            (
+                item
+                for item in controls
+                if item.get("shared_control_key") == shared_key
+                and self._shared_candidate(item)
+                and not item.get("disabled")
+            ),
+            None,
+        )
+        if current is None:
+            return None
+        reused["current_descriptor"] = current
+        return reused
 
     def _write_screenshot(self, page, path: Path) -> bool:
         if not self.safety.get("capture_screenshots", True):
@@ -243,7 +322,10 @@ class PageExplorer:
         if self._current_risk is not None:
             evidence.setdefault("risk", self._current_risk.to_dict())
         evidence = self.redactor.redact_value(evidence)
-        return self.storage.record_action(
+        after_fingerprint = evidence.pop("after_fingerprint", None)
+        label = self.redactor.redact_text(descriptor.get("label") or "未命名控件")
+        safe_outcome = self.redactor.redact_text(outcome)
+        action_id = self.storage.record_action(
             self.run_id,
             int(row["page_id"]),
             int(row["state_id"]),
@@ -251,13 +333,33 @@ class PageExplorer:
             int(row["id"]),
             status,
             action_type,
-            self.redactor.redact_text(descriptor.get("label") or "未命名控件"),
+            label,
             row.get("state_fingerprint"),
-            evidence.pop("after_fingerprint", None),
-            self.redactor.redact_text(outcome),
+            after_fingerprint,
+            safe_outcome,
             self.redactor.redact_value(row["full_path"]),
             evidence,
         )
+        if status in REUSABLE_SHARED_STATUSES and self._shared_candidate(descriptor):
+            self.storage.remember_shared_control_result(
+                self.run_id,
+                self.shared_context_key,
+                descriptor["shared_control_key"],
+                str(descriptor.get("shared_scope") or ""),
+                str(descriptor.get("shared_confidence") or ""),
+                int(row["page_id"]),
+                int(row["control_id"]),
+                action_id,
+                status,
+                safe_outcome,
+                {
+                    "label": label,
+                    "action_type": action_type,
+                    "after_fingerprint": after_fingerprint,
+                    "evidence": evidence,
+                },
+            )
+        return action_id
 
     def _page_count(self) -> int:
         return self.storage.scalar("SELECT COUNT(*) FROM page_nodes WHERE run_id=?", (self.run_id,))
@@ -938,6 +1040,37 @@ class PageExplorer:
                     int(row["id"]),
                     "DYNAMIC_DISABLED",
                     {"disabled": True, "risk": risk.to_dict(), "outcome": outcome},
+                )
+                return
+            reused = self._verified_shared_result(page, row)
+            if reused:
+                outcome = (
+                    f"已确认共享控件在当前页面仍然可见、可用且指纹一致；"
+                    f"复用页面 {reused['source_page_id']}（{reused['source_page_url']}）的 "
+                    f"{reused['source_status']} 结果，不重复点击"
+                )
+                evidence = {
+                    "shared_control_key": descriptor["shared_control_key"],
+                    "shared_scope": descriptor.get("shared_scope"),
+                    "shared_confidence": descriptor.get("shared_confidence"),
+                    "source_page_id": reused["source_page_id"],
+                    "source_page_url": reused["source_page_url"],
+                    "source_control_id": reused["source_control_id"],
+                    "source_action_id": reused["source_action_id"],
+                    "source_status": reused["source_status"],
+                    "source_outcome": reused["source_outcome"],
+                }
+                action_id = self._record_action(
+                    row,
+                    "SHARED_CONTROL_REUSED",
+                    "shared_control_reuse",
+                    outcome,
+                    evidence=evidence,
+                )
+                self.storage.finish_frontier(
+                    int(row["id"]),
+                    "SHARED_CONTROL_REUSED",
+                    evidence | {"outcome": outcome, "action_id": action_id},
                 )
                 return
             if not risk.allowed:

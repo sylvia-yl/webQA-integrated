@@ -37,6 +37,19 @@ DEFAULTS: dict = {
         "allow_sensitive_pagepatrol": False,
         "allow_sensitive_target_storage": False,
     },
+    "deduplication": {
+        "shared_controls": {
+            "enabled": True,
+            "policy": "verify_then_reuse",
+            "scopes": ["header", "footer", "nav", "fixed", "sticky", "configured"],
+            "min_confidence": "high",
+            "include_selectors": [],
+            "exclude_selectors": [
+                "form button[type='submit']",
+                "form input[type='submit']",
+            ],
+        },
+    },
     "traversal": {
         "strategy": "layered",
         "parallel_pages": 3,
@@ -145,6 +158,23 @@ def validate_config(config: dict) -> None:
             "target 含 token、session、password 等敏感参数；默认禁止写入数据库。"
             "请改用 storage_state，或明确设置 safety.allow_sensitive_target_storage=true"
         )
+    shared = config["deduplication"]["shared_controls"]
+    if not isinstance(shared["enabled"], bool):
+        raise ValueError("deduplication.shared_controls.enabled 必须是布尔值")
+    if shared["policy"] != "verify_then_reuse":
+        raise ValueError("当前版本仅支持 shared_controls.policy=verify_then_reuse")
+    valid_scopes = {"header", "footer", "nav", "fixed", "sticky", "configured"}
+    scopes = shared.get("scopes")
+    if not isinstance(scopes, list) or not scopes or not set(scopes) <= valid_scopes:
+        raise ValueError(
+            "deduplication.shared_controls.scopes 只能包含 header/footer/nav/fixed/sticky/configured"
+        )
+    if shared["min_confidence"] not in {"medium", "high"}:
+        raise ValueError("deduplication.shared_controls.min_confidence 必须是 medium 或 high")
+    for key in ("include_selectors", "exclude_selectors"):
+        value = shared.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError(f"deduplication.shared_controls.{key} 必须是字符串列表")
 
 
 def apply_overrides(

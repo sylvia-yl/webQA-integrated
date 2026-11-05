@@ -30,6 +30,7 @@ def _status_cn(value: str) -> str:
         "TECH_PASS": "技术通过",
         "TECH_PASS_WITH_WARNINGS": "技术通过（有提示）",
         "STATE_DISCOVERED": "发现新状态",
+        "SHARED_CONTROL_REUSED": "共享控件已核验并复用",
         "LINK_RECORDED": "子页面链接已记录（未进入）",
         "LINK_RECORDED_AFTER_CLICK": "点击后识别子页面（未继续测试）",
         "DUPLICATE_LINK": "重复链接（未再点击）",

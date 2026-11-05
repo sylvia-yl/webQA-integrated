@@ -163,6 +163,26 @@ CREATE TABLE IF NOT EXISTS actions (
 );
 CREATE INDEX IF NOT EXISTS idx_actions_page ON actions(page_id, id);
 
+CREATE TABLE IF NOT EXISTS shared_control_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    context_key TEXT NOT NULL,
+    shared_key TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    source_page_id INTEGER NOT NULL REFERENCES page_nodes(id),
+    source_control_id INTEGER NOT NULL REFERENCES controls(id),
+    source_action_id INTEGER NOT NULL REFERENCES actions(id),
+    source_status TEXT NOT NULL,
+    source_outcome TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id, context_key, shared_key)
+);
+CREATE INDEX IF NOT EXISTS idx_shared_control_lookup
+    ON shared_control_results(run_id, context_key, shared_key);
+
 CREATE TABLE IF NOT EXISTS link_visits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL REFERENCES runs(id),
@@ -285,7 +305,7 @@ class Storage:
         self._local = threading.local()
         conn = self.connection()
         conn.executescript(SCHEMA)
-        conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version','2')")
+        conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version','3')")
         conn.commit()
 
     def connection(self) -> sqlite3.Connection:
@@ -918,6 +938,67 @@ class Storage:
                 ),
             )
             return int(cur.lastrowid)
+
+    def remember_shared_control_result(
+        self,
+        run_id: str,
+        context_key: str,
+        shared_key: str,
+        scope: str,
+        confidence: str,
+        source_page_id: int,
+        source_control_id: int,
+        source_action_id: int,
+        source_status: str,
+        source_outcome: str,
+        result: dict,
+    ) -> None:
+        now = now_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO shared_control_results(
+                       run_id,context_key,shared_key,scope,confidence,source_page_id,
+                       source_control_id,source_action_id,source_status,source_outcome,
+                       result_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(run_id,context_key,shared_key) DO NOTHING""",
+                (
+                    run_id,
+                    context_key,
+                    shared_key,
+                    scope,
+                    confidence,
+                    source_page_id,
+                    source_control_id,
+                    source_action_id,
+                    source_status,
+                    source_outcome,
+                    json_text(result),
+                    now,
+                    now,
+                ),
+            )
+
+    def reusable_shared_control_result(
+        self,
+        run_id: str,
+        context_key: str,
+        shared_key: str,
+        current_page_id: int,
+    ) -> dict | None:
+        row = self.connection().execute(
+            """SELECT s.*,p.url AS source_page_url,p.title AS source_page_title
+               FROM shared_control_results s
+               JOIN page_nodes p ON p.id=s.source_page_id
+               WHERE s.run_id=? AND s.context_key=? AND s.shared_key=? AND s.source_page_id<>?
+               LIMIT 1""",
+            (run_id, context_key, shared_key, current_page_id),
+        ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        value["result"] = json_load(value.pop("result_json"), {})
+        return value
 
     def reserve_link(
         self,

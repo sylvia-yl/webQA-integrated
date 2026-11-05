@@ -51,6 +51,21 @@ safety:
   # 启动 URL 含敏感参数时默认拒绝运行，避免明文写入断点数据库。
   allow_sensitive_target_storage: false
 
+deduplication:
+  shared_controls:
+    # 首次完整测试；后续页面确认控件仍可见、可用且指纹一致后，不再点击。
+    enabled: true
+    policy: verify_then_reuse
+    scopes: [header, footer, nav, fixed, sticky, configured]
+    # high 要求稳定属性、固定链接或显式配置；改成 medium 会接受全局区域中的语义匹配。
+    min_confidence: high
+    # 对没有稳定 id/data-testid 的 AI 助手等控件，可在这里显式指定。
+    include_selectors: []
+    # 页面业务表单提交按钮不参与跨页面复用。
+    exclude_selectors:
+      - "form button[type='submit']"
+      - "form input[type='submit']"
+
 traversal:
   # 同一深度全部完成后，才开始下一层。
   strategy: layered

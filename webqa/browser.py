@@ -24,8 +24,47 @@ INTERACTIVE_SELECTOR = ",".join(
 
 
 COLLECT_JS = r"""
-({selector}) => {
+({selector, includeSelectors = [], excludeSelectors = []}) => {
   const compact = value => (value || '').replace(/\s+/g, ' ').trim();
+  const matchedSelector = (el, selectors) => selectors.find(value => {
+    try { return el.matches(value); } catch (_) { return false; }
+  }) || '';
+  const testId = el => el.getAttribute('data-testid') || el.getAttribute('data-test') || el.getAttribute('data-qa') || '';
+  const containerSignature = el => [
+    el.tagName?.toLowerCase() || '',
+    el.getAttribute('role') || '',
+    el.id || '',
+    testId(el),
+    compact(el.getAttribute('aria-label')),
+  ].join('|').slice(0, 400);
+  const sharedContext = el => {
+    if (matchedSelector(el, excludeSelectors)) return {scope: '', signature: '', forced: false};
+    const includeSelector = matchedSelector(el, includeSelectors);
+    if (includeSelector) {
+      return {scope: 'configured', signature: 'selector:' + includeSelector, forced: true};
+    }
+    const header = el.closest('header,[role="banner"]');
+    if (header && !header.closest('main,[role="main"],article')) {
+      return {scope: 'header', signature: containerSignature(header), forced: false};
+    }
+    const footer = el.closest('footer,[role="contentinfo"]');
+    if (footer && !footer.closest('main,[role="main"],article')) {
+      return {scope: 'footer', signature: containerSignature(footer), forced: false};
+    }
+    const nav = el.closest('nav,[role="navigation"]');
+    if (nav && !nav.closest('main,[role="main"],article')) {
+      return {scope: 'nav', signature: containerSignature(nav), forced: false};
+    }
+    let node = el;
+    while (node && node.nodeType === 1) {
+      const position = getComputedStyle(node).position;
+      if (position === 'fixed' || position === 'sticky') {
+        return {scope: position, signature: containerSignature(node), forced: false};
+      }
+      node = node.parentElement;
+    }
+    return {scope: '', signature: '', forced: false};
+  };
   const rendered = el => {
     if (!el || !el.isConnected) return false;
     if (el.closest('[hidden],[inert],[aria-hidden="true"]')) return false;
@@ -156,6 +195,7 @@ COLLECT_JS = r"""
       else if (/菜单|menu/.test(clue)) iconName = 'menu';
     }
     const visualControl = ['BUTTON','A','SUMMARY'].includes(el.tagName) || ['button','link','tab','menuitem'].includes(roleOf(el));
+    const shared = sharedContext(el);
     return {
       tag: el.tagName.toLowerCase(),
       role: roleOf(el),
@@ -168,6 +208,10 @@ COLLECT_JS = r"""
       aria: compact(el.getAttribute('aria-label')).slice(0, 240),
       title: compact(el.getAttribute('title')).slice(0, 240),
       placeholder: compact(el.getAttribute('placeholder')).slice(0, 240),
+      stable_id: compact(el.id).slice(0, 160),
+      testid: compact(testId(el)).slice(0, 160),
+      name: compact(el.getAttribute('name')).slice(0, 160),
+      document_language: compact(document.documentElement.lang).slice(0, 40),
       href,
       target: el.getAttribute('target') || '',
       download: el.hasAttribute('download'),
@@ -177,6 +221,9 @@ COLLECT_JS = r"""
       checked: typeof el.checked === 'boolean' ? el.checked : null,
       selected: el.tagName === 'SELECT' ? el.value : null,
       section: section(el).slice(0, 160),
+      shared_scope: shared.scope,
+      shared_container_signature: shared.signature,
+      shared_forced: shared.forced,
       selector: cssPath(el),
       domIndex,
       rect: {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)},
@@ -307,18 +354,72 @@ def enrich_controls(base_url: str, controls: list[dict]) -> list[dict]:
         item["semantic_key"] = sha(semantic_raw, 24)
         item["behavior_key"] = sha(behavior_raw, 24)
         item["control_key"] = sha(behavior_raw + "|" + str(item.get("selector")), 24)
+        shared_scope = _norm(item.get("shared_scope"))
+        stable_attribute = next(
+            (
+                f"{key}:{_norm(item.get(key))}"
+                for key in ("testid", "stable_id", "name")
+                if _norm(item.get(key))
+            ),
+            "",
+        )
+        if shared_scope:
+            strong_semantics = bool(
+                stable_attribute
+                or href_key
+                or _norm(item.get("aria"))
+                or _norm(item.get("title"))
+                or item.get("shared_forced")
+            )
+            item["shared_confidence"] = "high" if strong_semantics else "medium"
+            shared_raw = "|".join(
+                [
+                    _norm(urlsplit(base_url).netloc),
+                    _norm(item.get("document_language")),
+                    shared_scope,
+                    _norm(item.get("shared_container_signature")),
+                    _norm(item.get("role")),
+                    _norm(item.get("tag")),
+                    _norm(item.get("type")),
+                    stable_attribute,
+                    _norm(item["label"]),
+                    _norm(href_key),
+                ]
+            )
+            item["shared_control_key"] = sha(shared_raw, 32)
+        else:
+            item["shared_confidence"] = "none"
+            item["shared_control_key"] = ""
         enriched.append(item)
     return enriched
 
 
-def collect_controls(page, base_url: str, max_controls: int) -> list[dict]:
-    raw = page.evaluate(COLLECT_JS, {"selector": INTERACTIVE_SELECTOR})
+def collect_controls(
+    page,
+    base_url: str,
+    max_controls: int,
+    shared_rules: dict | None = None,
+) -> list[dict]:
+    shared_rules = shared_rules or {}
+    raw = page.evaluate(
+        COLLECT_JS,
+        {
+            "selector": INTERACTIVE_SELECTOR,
+            "includeSelectors": shared_rules.get("include_selectors") or [],
+            "excludeSelectors": shared_rules.get("exclude_selectors") or [],
+        },
+    )
     return enrich_controls(base_url, raw[:max_controls])
 
 
-def snapshot(page, base_url: str, max_controls: int) -> tuple[dict, list[dict]]:
+def snapshot(
+    page,
+    base_url: str,
+    max_controls: int,
+    shared_rules: dict | None = None,
+) -> tuple[dict, list[dict]]:
     content = page.evaluate(SNAPSHOT_JS)
-    controls = collect_controls(page, base_url, max_controls)
+    controls = collect_controls(page, base_url, max_controls, shared_rules)
     control_state = sorted({item["semantic_key"] for item in controls})
     stable = {
         "url": canonical_url(base_url, content.get("url") or base_url),

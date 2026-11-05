@@ -15,7 +15,10 @@ from webqa.storage import Storage
 
 
 HOME = b"""<!doctype html><html lang='en' class='dark'><head><title>Home</title>
-<style>#menu{display:none}.hidden{display:none}</style></head><body>
+<style>#menu{display:none}.hidden{display:none}#shared-ai{position:fixed;right:12px;bottom:12px}</style></head><body>
+<header><button id='shared-global' aria-label='Global settings' onclick="if(!document.querySelector('#global-panel'))document.body.insertAdjacentHTML('beforeend','<p id=global-panel>global changed</p>')">Global settings</button><button id='shared-noop' aria-label='Shared no-op'>Shared no-op</button></header>
+<button id='shared-ai' aria-label='AI assistant' onclick="if(!document.querySelector('#ai-panel'))document.body.insertAdjacentHTML('beforeend','<div id=ai-panel role=dialog>AI panel</div>')">AI assistant</button>
+<main><button id='page-action' onclick="if(!document.querySelector('#page-result'))document.body.insertAdjacentHTML('beforeend','<p id=page-result>home action</p>')">Page action</button></main>
 <h1>Home</h1>
 <button id='toggle' aria-expanded='false' onclick="const m=document.querySelector('#menu');const open=m.style.display==='block';m.style.display=open?'none':'block';this.setAttribute('aria-expanded',String(!open))">Resources</button>
 <button id='theme' aria-label='Switch to light theme' onclick="const light=document.documentElement.classList.toggle('light');document.documentElement.classList.toggle('dark',!light);this.setAttribute('aria-label',light?'Switch to dark theme':'Switch to light theme')"><svg data-lucide='sun'></svg></button>
@@ -25,7 +28,11 @@ HOME = b"""<!doctype html><html lang='en' class='dark'><head><title>Home</title>
 <a class='hidden' href='/hidden'>Invisible child</a>
 </body></html>"""
 
-CHILD = b"""<!doctype html><html lang='en'><head><title>Child</title></head><body>
+CHILD = b"""<!doctype html><html lang='en'><head><title>Child</title>
+<style>#shared-ai{position:fixed;right:12px;bottom:12px}</style></head><body>
+<header><button id='shared-global' aria-label='Global settings' onclick="if(!document.querySelector('#global-panel'))document.body.insertAdjacentHTML('beforeend','<p id=global-panel>global changed</p>')">Global settings</button><button id='shared-noop' aria-label='Shared no-op'>Shared no-op</button></header>
+<button id='shared-ai' aria-label='AI assistant' onclick="if(!document.querySelector('#ai-panel'))document.body.insertAdjacentHTML('beforeend','<div id=ai-panel role=dialog>AI panel</div>')">AI assistant</button>
+<main><button id='page-action' onclick="if(!document.querySelector('#page-result'))document.body.insertAdjacentHTML('beforeend','<p id=page-result>child action</p>')">Page action</button></main>
 <h1>Child loaded</h1><button onclick="document.body.insertAdjacentHTML('beforeend','<p>new content</p>')">Details</button>
 <a href='/grandchild'>Grandchild</a>
 </body></html>"""
@@ -172,6 +179,37 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(root_attempts, int(pages[0]["attempts"]))
             self.assertEqual("DONE", pages[1]["status"])
             self.assertEqual("Child", pages[1]["title"])
+            shared_results = storage.rows(
+                "SELECT * FROM shared_control_results WHERE run_id=? ORDER BY id",
+                (run_id,),
+            )
+            self.assertGreaterEqual(len(shared_results), 2)
+            reused_actions = storage.rows(
+                "SELECT label,status,evidence_json FROM actions WHERE run_id=? AND page_id=? "
+                "AND status='SHARED_CONTROL_REUSED' ORDER BY id",
+                (run_id, pages[1]["id"]),
+            )
+            reused_labels = {row["label"] for row in reused_actions}
+            self.assertIn("Global settings", reused_labels)
+            self.assertIn("AI assistant", reused_labels)
+            child_noop = storage.rows(
+                "SELECT status FROM actions WHERE run_id=? AND page_id=? AND label='Shared no-op' ORDER BY id",
+                (run_id, pages[1]["id"]),
+            )
+            self.assertTrue(child_noop)
+            self.assertNotIn(
+                "SHARED_CONTROL_REUSED",
+                {row["status"] for row in child_noop},
+            )
+            child_page_action = storage.rows(
+                "SELECT status FROM actions WHERE run_id=? AND page_id=? AND label='Page action' ORDER BY id",
+                (run_id, pages[1]["id"]),
+            )
+            self.assertTrue(child_page_action)
+            self.assertNotIn(
+                "SHARED_CONTROL_REUSED",
+                {row["status"] for row in child_page_action},
+            )
             self.assertEqual(
                 0,
                 storage.scalar(
