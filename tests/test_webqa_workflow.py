@@ -41,10 +41,17 @@ GRANDCHILD = b"""<!doctype html><html lang='en'><head><title>Grandchild</title><
 <h1>Grandchild loaded</h1>
 </body></html>"""
 
+SEMANTIC_FAILURE = """<!doctype html><html lang='zh-CN'><head><title>排行榜</title></head><body>
+<main><h1>排行榜</h1><table><thead><tr><th>排名</th><th>节点</th></tr></thead><tbody></tbody></table>
+<p role='status'>暂时读不到数据，公开接口没有响应，可以稍后重试。</p></main>
+</body></html>""".encode("utf-8")
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/child"):
+        if self.path.startswith("/semantic-failure"):
+            body = SEMANTIC_FAILURE
+        elif self.path.startswith("/child"):
             body = CHILD
         elif self.path.startswith("/grandchild"):
             body = GRANDCHILD
@@ -249,6 +256,7 @@ class WorkflowTest(unittest.TestCase):
             self.assertTrue((run_dir / "live-status.md").exists())
             report = md_path.read_text(encoding="utf-8")
             self.assertIn("提高深度接续", report)
+            self.assertIn("页面理解与语义 Oracle", report)
             self.assertIn("Menu child", report)
             self.assertIn("Grandchild", report)
             self.assertIn("等待更深轮次解锁：1", report)
@@ -259,6 +267,78 @@ class WorkflowTest(unittest.TestCase):
                 (legacy_artifact_id,),
             )[0]
             Path(migrated["path"]).resolve().relative_to(run_dir.resolve())
+            semantic_phases = {
+                row["phase"]
+                for row in storage.rows(
+                    "SELECT phase FROM semantic_evaluations WHERE run_id=?", (run_id,)
+                )
+            }
+            self.assertIn("INITIAL_PAGE", semantic_phases)
+            self.assertIn("STATE_AFTER_ACTION", semantic_phases)
+            transitions = storage.rows(
+                "SELECT from_state,to_state FROM qa_state_transitions WHERE run_id=?",
+                (run_id,),
+            )
+            self.assertTrue(
+                any(
+                    row["from_state"] == "OBSERVE" and row["to_state"] == "CLASSIFY"
+                    for row in transitions
+                )
+            )
+            storage.close_thread_connection()
+
+    def test_semantic_content_failure_is_confirmed_in_two_fresh_contexts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = copy.deepcopy(DEFAULTS)
+            config["target"] = (
+                f"http://127.0.0.1:{self.server.server_port}/semantic-failure"
+            )
+            config["scope"]["max_page_depth"] = 0
+            config["traversal"].update(
+                {
+                    "parallel_pages": 1,
+                    "max_actions_per_page": 1,
+                    "settle_ms": 50,
+                    "retry_limit": 1,
+                }
+            )
+            config["pagepatrol"]["enabled"] = False
+            config["output"]["directory"] = str(root / "output")
+            config["output"]["database"] = str(root / "output" / "webqa.sqlite3")
+            storage = Storage(config["output"]["database"])
+            run_id, _ = storage.create_or_resume_run(config, new_run=True)
+            run_dir = root / "output" / "runs" / run_id
+
+            LayeredRunner(
+                storage, run_id, config, run_dir, pagepatrol_enabled=False
+            ).run()
+
+            findings = storage.rows(
+                """SELECT sf.classification,sf.status,sf.bug_id
+                   FROM semantic_findings sf
+                   JOIN semantic_evaluations se ON se.id=sf.evaluation_id
+                   WHERE se.run_id=? ORDER BY sf.id""",
+                (run_id,),
+            )
+            by_class = {row["classification"]: row for row in findings}
+            self.assertEqual("CONFIRMED", by_class["CONTENT_UNAVAILABLE"]["status"])
+            self.assertEqual("CONFIRMED", by_class["DATA_MISSING"]["status"])
+            bugs = storage.rows("SELECT * FROM bugs WHERE run_id=? ORDER BY id", (run_id,))
+            self.assertEqual(2, len(bugs))
+            self.assertTrue(all(row["status"] == "CONFIRMED" for row in bugs))
+            for bug in bugs:
+                self.assertEqual(
+                    2,
+                    storage.scalar(
+                        "SELECT COUNT(*) FROM reproductions WHERE bug_id=? AND reproduced=1",
+                        (bug["id"],),
+                    ),
+                )
+            report = (run_dir / "WebQA测试报告.md").read_text(encoding="utf-8")
+            self.assertIn("CONTENT_UNAVAILABLE", report)
+            self.assertIn("DATA_MISSING", report)
+            self.assertIn("独立复现：2/2", report)
             storage.close_thread_connection()
 
     def test_running_items_are_recovered_for_resume(self):

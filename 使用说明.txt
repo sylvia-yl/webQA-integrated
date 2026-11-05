@@ -62,6 +62,7 @@ D:\ThreeProjects\webQA-integrated\webqa-output\runs\<开始时间-实例ID>\
 - screenshots：页面状态截图。
 - traces：缺陷复现轨迹；默认关闭，只有显式启用 `safety.capture_traces` 才生成。
 - pagepatrol：PagePatrol 原始报告。
+- semantic-reproductions：高可信内容语义异常的两次独立复现截图。
 
 四、刚才的网址如何测试主页
 
@@ -83,3 +84,6 @@ D:\ThreeProjects\webQA-integrated\webqa-output\runs\<开始时间-实例ID>\
 - 动作已经触发但结果不确定时标记为 UNKNOWN_COMMIT，不自动重试。
 - 页眉、页脚、全局导航及悬浮控件首次成功测试后，在同一次运行的其他页面只做可见性、可用性和实时指纹核验；一致时记录 SHARED_CONTROL_REUSED，不再次点击。
 - 页面业务区、表单提交、失败或未确认的控件不会复用；新建回归实例会全部重新测试。
+- 每个页面及动作后的新状态都会进行语义检查；HTTP 200 不会被直接视为内容正常。
+- 明确的内容不可用、数据缺失和持续加载会独立复现；主观或低可信文案问题只列为待确认。
+- 语义模型默认未配置，报告会明确显示 DETERMINISTIC_ONLY；如启用模型但适配器不可用，会记录 SEMANTIC_CHECK_UNAVAILABLE，而不是静默通过。

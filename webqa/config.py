@@ -23,6 +23,22 @@ DEFAULTS: dict = {
     "prohibited": ["payment", "delete", "publish", "oauth"],
     "exclude": ["ai_answer_quality"],
     "language": "zh-CN",
+    "expected_behavior": [],
+    "semantic": {
+        "enabled": True,
+        # required 表示每次页面观察都必须经过语义阶段；不是“必须调用大模型”。
+        "required": True,
+        "loading_timeout_ms": 8000,
+        "model": {
+            "enabled": False,
+            "required": False,
+            "provider": "none",
+            "adapter": "",
+            "options": {},
+        },
+        "failure_patterns": [],
+        "empty_state_patterns": [],
+    },
     "safety": {
         "allow_stateful_actions": False,
         "allow_destructive_actions": False,
@@ -175,6 +191,35 @@ def validate_config(config: dict) -> None:
         value = shared.get(key)
         if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
             raise ValueError(f"deduplication.shared_controls.{key} 必须是字符串列表")
+    semantic = config["semantic"]
+    for key in ("enabled", "required"):
+        if not isinstance(semantic[key], bool):
+            raise ValueError(f"semantic.{key} 必须是布尔值")
+    if semantic["required"] and not semantic["enabled"]:
+        raise ValueError("semantic.required=true 时不能关闭 semantic.enabled")
+    if not 100 <= int(semantic["loading_timeout_ms"]) <= 120000:
+        raise ValueError("semantic.loading_timeout_ms 必须在 100 到 120000 之间")
+    model = semantic["model"]
+    for key in ("enabled", "required"):
+        if not isinstance(model[key], bool):
+            raise ValueError(f"semantic.model.{key} 必须是布尔值")
+    if model["required"] and not model["enabled"]:
+        raise ValueError("semantic.model.required=true 时必须设置 semantic.model.enabled=true")
+    if model["enabled"] and model.get("provider") not in {"python"}:
+        raise ValueError("启用语义模型时 semantic.model.provider 当前必须为 python")
+    if model["enabled"] and not isinstance(model.get("adapter"), str):
+        raise ValueError("semantic.model.adapter 必须是 package.module:factory 字符串")
+    if not isinstance(model.get("options"), dict):
+        raise ValueError("semantic.model.options 必须是对象")
+    if Redactor(safety).redact_value(model.get("options") or {}) != (model.get("options") or {}):
+        raise ValueError(
+            "semantic.model.options 不得保存 token、api_key、password 等秘密；"
+            "模型适配器应从环境变量或系统凭据存储读取"
+        )
+    for key in ("failure_patterns", "empty_state_patterns"):
+        patterns = semantic.get(key)
+        if not isinstance(patterns, list) or not all(isinstance(item, str) and item for item in patterns):
+            raise ValueError(f"semantic.{key} 必须是字符串列表")
 
 
 def apply_overrides(

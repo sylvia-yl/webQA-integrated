@@ -11,7 +11,29 @@ scope:
     height: 900
 
 expected_behavior:
-  - 页面内容与控件语义一致
+  # 字符串规则会作为可追溯需求保存；需要确定性自动判定时使用下面的结构化格式。
+  - source: product_requirement
+    reference: 通用页面质量要求
+    expected_result: 页面内容与控件语义一致
+    confidence: medium
+
+semantic:
+  # 每次打开起始页、子页面或复现页后，都必须经过统一观察和语义分类。
+  enabled: true
+  required: true
+  loading_timeout_ms: 8000
+  model:
+    # 当前先启用确定性语义规则。接入模型适配器后再开启；若开启但不可用，
+    # 结果会明确标记 SEMANTIC_CHECK_UNAVAILABLE，不会静默算作通过。
+    enabled: false
+    required: false
+    provider: none
+    # 启用时设置为 package.module:factory；factory(options) 返回带 evaluate(...) 的适配器。
+    adapter: ""
+    options: {}
+  # 可按项目补充，不需要改 Python 代码。
+  failure_patterns: []
+  empty_state_patterns: []
 
 accounts:
   mode: guest

@@ -10,6 +10,13 @@ from urllib.parse import urlsplit
 from .browser import action_step, locate_control, observable_delta, snapshot
 from .pagepatrol import run_pagepatrol
 from .planner_rules import plan_field_cases
+from .semantic import (
+    PageObservation,
+    SemanticAnalyzer,
+    collect_page_observation,
+    load_semantic_model,
+    normalize_oracle_rules,
+)
 from .safety import (
     ActionRisk,
     Redactor,
@@ -119,6 +126,20 @@ class PageExplorer:
         self.settings = config["traversal"]
         self.safety = config.get("safety") or {}
         self.redactor = Redactor(self.safety)
+        self.semantic_settings = config.get("semantic") or {}
+        for rule in normalize_oracle_rules(config.get("expected_behavior")):
+            self.storage.upsert_business_rule(
+                self.host,
+                rule.rule_key,
+                self.redactor.redact_text(str(rule.expected)),
+                "ACTIVE",
+                self.redactor.redact_value({"rule": rule.to_dict()}),
+            )
+        self.semantic = SemanticAnalyzer(
+            self.semantic_settings,
+            model=load_semantic_model(self.semantic_settings),
+            persisted_rules=self.storage.business_rules(self.host),
+        )
         self.shared_settings = (
             (config.get("deduplication") or {}).get("shared_controls") or {}
         )
@@ -389,88 +410,160 @@ class PageExplorer:
             int(row["control_id"]),
         )
 
-    def _link_load_result(self, page, log: EventLog) -> dict:
-        loading_wait_timed_out = False
-        try:
-            page.wait_for_function(
-                """() => {
-                  const visible = el => {
-                    const r=el.getBoundingClientRect(),s=getComputedStyle(el);
-                    return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity)!==0;
-                  };
-                  const selector='[aria-busy="true"],[data-loading="true"],[data-state="loading"],.skeleton,[class*="skeleton"],[class*="spinner"],[class~="loading"]';
-                  return document.readyState==='complete' && !Array.from(document.querySelectorAll(selector)).some(visible);
-                }""",
-                timeout=8000,
+    def _link_load_result(
+        self,
+        page,
+        log: EventLog,
+        *,
+        page_id: int,
+        phase: str,
+        http_status: int | None = None,
+        persist: bool = True,
+    ) -> dict:
+        """Run the same observation and semantic gate for every page entry path."""
+        if persist:
+            self.storage.record_qa_transition(
+                self.run_id,
+                page_id,
+                phase,
+                "EXECUTE",
+                "OBSERVE",
+                "页面动作或导航完成，开始统一采集 DOM、网络与可见内容",
             )
-        except Exception:
-            loading_wait_timed_out = True
-        try:
-            content = page.evaluate(
-                """() => {
-                  const compact=v=>(v||'').replace(/\s+/g,' ').trim();
-                  const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0};
-                  const loadingSelector='[aria-busy="true"],[data-loading="true"],[data-state="loading"],.skeleton,[class*="skeleton"],[class*="spinner"],[class~="loading"]';
-                  const broken=Array.from(document.images).filter(img=>visible(img)&&img.complete&&img.naturalWidth===0).map(img=>img.currentSrc||img.src).slice(0,10);
-                  return {
-                    ready_state:document.readyState,
-                    body_text:compact(document.body?.innerText||''),
-                    main_text:compact(document.querySelector('main')?.innerText||''),
-                    h1:compact(document.querySelector('h1')?.innerText||''),
-                    alerts:Array.from(document.querySelectorAll('[role="alert"]')).filter(visible).map(x=>compact(x.innerText)).filter(Boolean).slice(0,10),
-                    loading:Array.from(document.querySelectorAll(loadingSelector)).filter(visible).map(x=>compact(x.innerText)||x.className||x.tagName).slice(0,10),
-                    broken_images:broken
-                  };
-                }"""
-            )
-        except Exception:
-            content = {"body_text": "", "main_text": "", "h1": "", "alerts": [], "loading": [], "broken_images": [], "ready_state": "unknown"}
-        body_chars = len(content.get("body_text") or "")
-        status = None
-        for item in reversed(log.responses):
-            if canonical_url(self.target, item["url"]) == canonical_url(self.target, page.url):
-                status = item["status"]
-                break
-        title = page.title() if not page.is_closed() else ""
-        error_surface = " ".join([title, content.get("h1") or ""] + list(content.get("alerts") or []))
-        error_page_re = re.compile(
-            r"(^|\b)(404|500|not found|page not found|internal server error|application error|server error)(\b|$)|"
-            r"页面不存在|找不到页面|服务器错误|内部错误|加载失败|出错了|发生错误",
-            re.I,
+        if http_status is None:
+            for item in reversed(log.responses):
+                if canonical_url(self.target, item["url"]) == canonical_url(self.target, page.url):
+                    http_status = item["status"]
+                    break
+        event_evidence = log.evidence()
+        observation = collect_page_observation(
+            page,
+            http_status=http_status,
+            event_evidence=event_evidence,
+            loading_timeout_ms=int(self.semantic_settings.get("loading_timeout_ms") or 8000),
         )
-        error_page = bool(error_page_re.search(error_surface))
+        observation_data = self.redactor.redact_value(observation.to_dict())
+        observation_fields = set(PageObservation.__dataclass_fields__)
+        model_observation = PageObservation(
+            **{
+                key: value
+                for key, value in observation_data.items()
+                if key in observation_fields
+            }
+        )
+        evaluation = self.semantic.evaluate(
+            observation,
+            model_observation=model_observation,
+        )
+        evaluation_data = self.redactor.redact_value(evaluation.to_dict())
+        evaluation_id = None
+        finding_records = evaluation_data.get("findings") or []
+        if persist:
+            evaluation_id, finding_records = self.storage.add_semantic_evaluation(
+                self.run_id,
+                page_id,
+                phase,
+                self.redactor.redact_url(observation.url),
+                observation_data,
+                evaluation_data,
+            )
+            self.storage.record_qa_transition(
+                self.run_id,
+                page_id,
+                phase,
+                "OBSERVE",
+                "CLASSIFY",
+                f"完成页面理解与语义分类：{evaluation.status}",
+                {
+                    "evaluation_id": evaluation_id,
+                    "coverage": evaluation.coverage,
+                    "page_type": evaluation.understanding.primary_type,
+                    "finding_count": len(finding_records),
+                },
+            )
+
         reasons: list[str] = []
-        if status is not None and status >= 400:
-            reasons.append(f"文档 HTTP {status}")
-        if body_chars < 50:
-            reasons.append(f"可见正文过少（{body_chars} 字符）")
-        if error_page:
-            reasons.append(f"标题、H1 或错误提示疑似错误页：{error_surface[:240]}")
-        if loading_wait_timed_out or content.get("loading"):
-            reasons.append("等待数据加载完成超时或仍存在可见加载占位")
-        if content.get("broken_images"):
-            reasons.append(f"存在 {len(content['broken_images'])} 个可见破图")
+        if http_status is not None and http_status >= 400:
+            reasons.append(f"文档 HTTP {http_status}")
+        if observation.body_chars == 0:
+            reasons.append("页面没有可见文本内容")
+        if observation.broken_images:
+            reasons.append(f"存在 {len(observation.broken_images)} 个可见破图")
         if log.page_errors:
             reasons.append(f"页面脚本异常：{log.page_errors[0]}")
         if log.response_errors:
             reasons.append(f"文档/API 错误响应：{log.response_errors[0]}")
+        blocking_semantic = [
+            finding
+            for finding in finding_records
+            if finding.get("classification")
+            in {
+                "CONTENT_UNAVAILABLE",
+                "DATA_MISSING",
+                "STUCK_LOADING",
+                "COPY_QUALITY",
+                "BUSINESS_MISMATCH",
+            }
+            and finding.get("confidence") == "high"
+        ]
+        reasons.extend(
+            f"{finding.get('classification')}：{finding.get('actual')}"
+            for finding in blocking_semantic
+        )
+        headings = observation.headings or []
         return {
-            "final_url": page.url,
-            "http_status": status,
-            "title": title,
-            "body_chars": body_chars,
-            "h1": content.get("h1") or "",
-            "main_chars": len(content.get("main_text") or ""),
-            "ready_state": content.get("ready_state"),
-            "loading_indicators": content.get("loading") or [],
-            "broken_images": content.get("broken_images") or [],
-            "error_page": error_page,
-            "response_errors": log.response_errors[:10],
+            "final_url": self.redactor.redact_url(observation.url),
+            "http_status": http_status,
+            "title": self.redactor.redact_text(observation.title),
+            "body_chars": observation.body_chars,
+            "h1": self.redactor.redact_text(headings[0] if headings else ""),
+            "main_chars": observation.main_chars,
+            "ready_state": observation.ready_state,
+            "loading_indicators": self.redactor.redact_value(observation.loading_indicators),
+            "broken_images": self.redactor.redact_value(observation.broken_images),
+            "error_page": evaluation.understanding.primary_type == "ERROR",
+            "response_errors": event_evidence.get("response_errors") or [],
             "loaded": not reasons,
             "load_check_reasons": reasons,
+            "semantic_evaluation_id": evaluation_id,
+            "semantic_status": evaluation.status,
+            "semantic_coverage": evaluation.coverage,
+            "page_type": evaluation.understanding.primary_type,
+            "semantic_findings": [
+                {
+                    key: finding.get(key)
+                    for key in (
+                        "id",
+                        "evaluation_id",
+                        "classification",
+                        "title",
+                        "status",
+                        "severity",
+                        "confidence",
+                        "oracle_source",
+                        "expected",
+                        "actual",
+                        "evidence",
+                        "bug_eligible",
+                        "fingerprint",
+                        "previously_observed",
+                        "previous_finding_id",
+                    )
+                    if key in finding
+                }
+                for finding in finding_records
+            ],
         }
 
-    def _click_link(self, page, context, locator, descriptor: dict, log: EventLog) -> tuple[object, dict]:
+    def _click_link(
+        self,
+        page,
+        context,
+        locator,
+        descriptor: dict,
+        log: EventLog,
+        page_id: int,
+    ) -> tuple[object, dict]:
         popups: list = []
         popup_logs: list[EventLog] = []
 
@@ -495,7 +588,12 @@ class PageExplorer:
             else:
                 self._settle(destination_page)
             active_log = popup_logs[-1] if popup_logs else log
-            result = self._link_load_result(destination_page, active_log)
+            result = self._link_load_result(
+                destination_page,
+                active_log,
+                page_id=page_id,
+                phase="LINK_DESTINATION",
+            )
             result["open_mode"] = "新标签页/窗口" if popups else "当前标签页"
             result["event_evidence"] = active_log.evidence()
             return destination_page, result
@@ -626,7 +724,9 @@ class PageExplorer:
             self.storage.finish_frontier(int(row["id"]), "DUPLICATE_LINK", {"target": target})
             return
 
-        destination_page, result = self._click_link(page, context, locator, descriptor, log)
+        destination_page, result = self._click_link(
+            page, context, locator, descriptor, log, int(page_row["id"])
+        )
         final_url = canonical_url(self.target, result["final_url"])
         screenshot_path = self._capture_link_proof(destination_page, page_row, row, final_url)
         result["screenshot_path"] = screenshot_path
@@ -831,6 +931,199 @@ class PageExplorer:
         self.storage.finish_bug(bug_id, status, triage)
         return status, bug_id
 
+    def _reproduce_semantic_findings(
+        self,
+        browser,
+        page_row: dict,
+        findings: list[dict],
+        *,
+        action_path: list | None = None,
+        action_id: int | None = None,
+    ) -> list[dict]:
+        """Confirm deterministic content defects in two fresh BrowserContexts."""
+        results: list[dict] = []
+        candidates = [
+            finding
+            for finding in findings
+            if finding.get("bug_eligible")
+            and finding.get("confidence") == "high"
+            and not finding.get("previously_observed")
+            and finding.get("classification")
+            in {"CONTENT_UNAVAILABLE", "DATA_MISSING", "STUCK_LOADING", "COPY_QUALITY", "BUSINESS_MISMATCH"}
+        ]
+        action_path = action_path or []
+        for finding in candidates:
+            classification = str(finding.get("classification") or "BUSINESS_MISMATCH")
+            bug_fingerprint = sha(
+                "|".join(
+                    [
+                        canonical_url(self.target, page_row["canonical_url"]),
+                        classification,
+                        str(finding.get("oracle_source") or ""),
+                        str(finding.get("expected") or ""),
+                        sha(json_text(action_path), 20),
+                    ]
+                ),
+                32,
+            )
+            initial_evidence = {
+                "classification": classification,
+                "oracle_source": finding.get("oracle_source"),
+                "expected": finding.get("expected"),
+                "actual": finding.get("actual"),
+                "confidence": finding.get("confidence"),
+                "severity": finding.get("severity"),
+                "preconditions": {
+                    "url": self.redactor.redact_url(page_row["url"]),
+                    "account_mode": (self.config.get("accounts") or {}).get("mode"),
+                    "language": self.config.get("language"),
+                },
+                "reproduction_steps": [
+                    f"在全新 BrowserContext 中打开 {self.redactor.redact_url(page_row['url'])}",
+                    *[
+                        str(step.get("label") or "执行页面内动作")
+                        for step in action_path
+                        if isinstance(step, dict)
+                    ],
+                    "等待页面进入内容、空状态或错误状态",
+                    f"再次执行 {classification} 语义判断",
+                ],
+                "impact": "用户无法可靠获得页面承诺的内容或业务结果",
+                "evidence": finding.get("evidence") or {},
+            }
+            bug_id = self.storage.create_bug_candidate(
+                self.run_id,
+                int(page_row["id"]),
+                action_id,
+                bug_fingerprint,
+                self.redactor.redact_text(str(finding.get("title") or classification)),
+                self.redactor.redact_value(
+                    json_load(page_row.get("arrival_path_json"), []) + action_path
+                ),
+                self.redactor.redact_value(initial_evidence),
+                severity=str(finding.get("severity") or "unknown"),
+            )
+            self.storage.record_qa_transition(
+                self.run_id,
+                int(page_row["id"]),
+                "SEMANTIC_REPRODUCTION",
+                "CLASSIFY",
+                "REPRODUCE",
+                f"高可信 {classification} 进入两个独立 BrowserContext 复验",
+                {"finding_id": finding.get("id"), "bug_id": bug_id},
+                action_id=action_id,
+            )
+            reproduced_count = 0
+            for attempt in (1, 2):
+                context = self._context(browser)
+                log = None
+                screen_dir = self.output_dir / "semantic-reproductions"
+                screenshot_path = screen_dir / f"bug-{bug_id:05d}-attempt-{attempt}.png"
+                evidence: dict = {}
+                reproduced = False
+                try:
+                    page, response, log = self._open(context, page_row["url"])
+                    if action_path:
+                        self._replay(page, action_path)
+                        log.clear()
+                    check = self._link_load_result(
+                        page,
+                        log,
+                        page_id=int(page_row["id"]),
+                        phase="SEMANTIC_REPRODUCTION",
+                        http_status=response.status if response else None,
+                        persist=False,
+                    )
+                    observed = [
+                        item
+                        for item in check.get("semantic_findings") or []
+                        if item.get("classification") == classification
+                        and item.get("confidence") == "high"
+                    ]
+                    reproduced = bool(observed)
+                    evidence = {
+                        "classification": classification,
+                        "semantic_status": check.get("semantic_status"),
+                        "semantic_coverage": check.get("semantic_coverage"),
+                        "observed_findings": observed,
+                        "event_evidence": log.evidence(),
+                    }
+                    if self.safety.get("capture_screenshots", True):
+                        screen_dir.mkdir(parents=True, exist_ok=True)
+                        self._write_screenshot(page, screenshot_path)
+                except Exception as exc:
+                    evidence = (log.evidence() if log else {}) | {
+                        "automation_error": self.redactor.redact_text(
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        "classification": classification,
+                    }
+                finally:
+                    if log:
+                        log.detach()
+                    context.close()
+                if reproduced:
+                    reproduced_count += 1
+                status = (
+                    "REPRODUCED"
+                    if reproduced
+                    else ("AUTOMATION_UNCONFIRMED" if evidence.get("automation_error") else "NOT_REPRODUCED")
+                )
+                self.storage.add_reproduction(
+                    bug_id,
+                    attempt,
+                    reproduced,
+                    status,
+                    self.redactor.redact_value(evidence),
+                    None,
+                    str(screenshot_path) if screenshot_path.exists() else None,
+                )
+                if screenshot_path.exists():
+                    self.storage.add_artifact(
+                        self.run_id,
+                        "semantic_reproduction_screenshot",
+                        str(screenshot_path),
+                        page_id=int(page_row["id"]),
+                        metadata={
+                            "bug_id": bug_id,
+                            "attempt": attempt,
+                            "classification": classification,
+                        },
+                    )
+            if reproduced_count == 2:
+                final_status = "CONFIRMED"
+                triage = "同一内容语义异常在两个全新 BrowserContext 中均稳定复现"
+            elif reproduced_count == 1:
+                final_status = "FLAKY"
+                triage = "两次独立复现中仅出现一次，归为偶发内容异常"
+            else:
+                final_status = "NOT_REPRODUCED"
+                triage = "两次独立复现均未出现，不列为确认缺陷"
+            self.storage.finish_bug(bug_id, final_status, triage)
+            self.storage.record_qa_transition(
+                self.run_id,
+                int(page_row["id"]),
+                "SEMANTIC_REPRODUCTION",
+                "REPRODUCE",
+                "REPORT",
+                triage,
+                {"bug_id": bug_id, "status": final_status, "reproduced": reproduced_count},
+                action_id=action_id,
+            )
+            if finding.get("id"):
+                self.storage.finish_semantic_finding(
+                    int(finding["id"]), final_status, bug_id
+                )
+            results.append(
+                {
+                    "finding_id": finding.get("id"),
+                    "bug_id": bug_id,
+                    "status": final_status,
+                    "reproduced": reproduced_count,
+                }
+            )
+        return results
+
     def _handle_state_action(self, browser, page, context, page_row: dict, row: dict, locator, log: EventLog) -> None:
         before, _ = self._snapshot(page)
         clipboard_before = ""
@@ -907,11 +1200,35 @@ class PageExplorer:
                     row["full_path"],
                 )
                 if reserved:
-                    load_result = self._link_load_result(page, log)
-                    self.storage.finish_link(int(visit["id"]), "CONFIRMED", **load_result)
-                    arrival = list(row["full_path"]) + [{"label": f"已到达：{load_result.get('title') or after_canon}", "url": after_canon}]
-                    target_page_id, _ = self._schedule_destination(page_row, row, after_canon, arrival)
-                    status, outcome = "TECH_PASS", f"无 href 控件完成页面跳转：{after_canon}；留到下一层深入测试"
+                    load_result = self._link_load_result(
+                        page,
+                        log,
+                        page_id=int(page_row["id"]),
+                        phase="DYNAMIC_LINK_DESTINATION",
+                    )
+                    if load_result["loaded"]:
+                        self.storage.finish_link(int(visit["id"]), "CONFIRMED", **load_result)
+                        arrival = list(row["full_path"]) + [
+                            {
+                                "label": f"已到达：{load_result.get('title') or after_canon}",
+                                "url": after_canon,
+                            }
+                        ]
+                        target_page_id, _ = self._schedule_destination(
+                            page_row, row, after_canon, arrival
+                        )
+                        status = "TECH_PASS"
+                        outcome = f"无 href 控件完成页面跳转：{after_canon}；留到下一层深入测试"
+                    else:
+                        reasons = "；".join(
+                            load_result.get("load_check_reasons") or ["未知加载校验原因"]
+                        )
+                        status = "UNCONFIRMED"
+                        outcome = f"无 href 控件跳转后的页面未通过统一观察：{after_canon}；{reasons}"
+                        target_page_id = None
+                        self.storage.finish_link(
+                            int(visit["id"]), "UNCONFIRMED", error=outcome, **load_result
+                        )
                     self.storage.add_edge(
                         self.run_id,
                         int(page_row["id"]),
@@ -945,12 +1262,31 @@ class PageExplorer:
             provisional_action_id,
             priority,
         )
+        semantic_result = self._link_load_result(
+            page,
+            log,
+            page_id=int(page_row["id"]),
+            phase="STATE_AFTER_ACTION",
+        )
+        semantic_candidates = [
+            finding
+            for finding in semantic_result.get("semantic_findings") or []
+            if finding.get("bug_eligible")
+            and finding.get("confidence") == "high"
+            and not finding.get("previously_observed")
+        ]
         changes = observable_delta(before, after)
         if clipboard_after and clipboard_after != clipboard_before:
             changes.append(f"剪贴板写入 {len(clipboard_after)} 个字符")
         if log.page_errors:
             status = "SUSPECTED"
             outcome = f"点击期间出现页面脚本异常，列为疑似问题等待独立复现：{log.page_errors[0]}"
+        elif semantic_candidates:
+            status = "SUSPECTED"
+            outcome = "动作后的页面状态触发高可信语义异常：" + "；".join(
+                f"{item.get('classification')}（{item.get('actual')}）"
+                for item in semantic_candidates
+            )
         elif is_new:
             status = "STATE_DISCOVERED"
             outcome = f"发现新页面状态并插队 {queued} 个新控件；" + ("；".join(changes) if changes else "状态指纹发生变化")
@@ -974,6 +1310,9 @@ class PageExplorer:
             after_theme=after.get("theme") or {},
             new_state_id=state_id,
             queued_controls=queued,
+            semantic_evaluation_id=semantic_result.get("semantic_evaluation_id"),
+            semantic_status=semantic_result.get("semantic_status"),
+            semantic_findings=semantic_result.get("semantic_findings") or [],
         )
         self.storage.finish_frontier(
             int(row["id"]),
@@ -987,6 +1326,14 @@ class PageExplorer:
                 row,
                 final_action_id,
                 log.page_errors[0],
+            )
+        if semantic_candidates:
+            self._reproduce_semantic_findings(
+                browser,
+                page_row,
+                semantic_candidates,
+                action_path=next_path,
+                action_id=final_action_id,
             )
 
     def _observe_after_failure(self, page, row: dict) -> dict:
@@ -1198,6 +1545,31 @@ class PageExplorer:
         if not self.storage.claim_page(page_id):
             return {"page_id": page_id, "status": "SKIPPED"}
         page_row = self.storage.page(page_id)
+        self.storage.record_qa_transition(
+            self.run_id,
+            page_id,
+            "PAGE",
+            None,
+            "UNDERSTAND_REQUIREMENT",
+            "开始处理页面并读取运行需求",
+        )
+        self.storage.record_qa_transition(
+            self.run_id,
+            page_id,
+            "PAGE",
+            "UNDERSTAND_REQUIREMENT",
+            "BUILD_ORACLE",
+            "已加载显式 expected_behavior、business_rules 与结构推断规则",
+            {"oracle_count": len(self.semantic.rules)},
+        )
+        self.storage.record_qa_transition(
+            self.run_id,
+            page_id,
+            "PAGE",
+            "BUILD_ORACLE",
+            "PREPARE_PRECONDITIONS",
+            "准备账户、语言、视口和隔离 BrowserContext",
+        )
         if self.pagepatrol_enabled:
             patrol = run_pagepatrol(self.config, self.output_dir, page_row["url"], page_id)
             for key in ("report_json", "report_html"):
@@ -1229,18 +1601,37 @@ class PageExplorer:
                     log = None
                     try:
                         page, response, log = self._open(context, page_row["url"])
-                        body_chars = int(page.evaluate("() => (document.body?.innerText || '').trim().length"))
                         http_status = response.status if response else None
+                        self.storage.record_qa_transition(
+                            self.run_id,
+                            page_id,
+                            "INITIAL_PAGE",
+                            "PREPARE_PRECONDITIONS",
+                            "EXECUTE",
+                            "前置条件已建立，打开目标页并等待稳定",
+                        )
+                        initial_result = self._link_load_result(
+                            page,
+                            log,
+                            page_id=page_id,
+                            phase="INITIAL_PAGE",
+                            http_status=http_status,
+                        )
+                        body_chars = int(initial_result["body_chars"])
                         if http_status is not None and http_status >= 400:
                             raise RuntimeError(f"页面返回 HTTP {http_status}")
                         if body_chars == 0:
                             raise RuntimeError("页面没有可见文本内容")
                         self.storage.update_page(
                             page_id,
-                            title=self.redactor.redact_text(page.title()),
+                            title=initial_result["title"],
                             http_status=http_status,
-                            final_url=self.redactor.redact_url(page.url),
-                            content_summary=f"可见文本 {body_chars} 字符",
+                            final_url=initial_result["final_url"],
+                            content_summary=(
+                                f"可见文本 {body_chars} 字符；页面类型 {initial_result['page_type']}；"
+                                f"语义状态 {initial_result['semantic_status']}；"
+                                f"覆盖 {initial_result['semantic_coverage']}"
+                            ),
                         )
                         state_id, _, _, controls, queued = self._register_state(page, page_row, [], None, 0)
                         if state_id is None:
@@ -1253,6 +1644,28 @@ class PageExplorer:
                                 f"页面 {page_row['url']} 初始状态发现 {len(controls)} 个可见控件，入队 {queued} 个"
                             ),
                         )
+                        semantic_reproductions = self._reproduce_semantic_findings(
+                            browser,
+                            page_row,
+                            initial_result.get("semantic_findings") or [],
+                        )
+                        if initial_result["semantic_status"] != "PASS":
+                            self.storage.add_message(
+                                self.run_id,
+                                "warning",
+                                "semantic",
+                                self.redactor.redact_text(
+                                    f"页面 {page_row['url']} 语义检查为 {initial_result['semantic_status']}，"
+                                    f"发现 {len(initial_result.get('semantic_findings') or [])} 项；"
+                                    f"独立复验 {len(semantic_reproductions)} 项"
+                                ),
+                                {
+                                    "evaluation_id": initial_result.get("semantic_evaluation_id"),
+                                    "status": initial_result.get("semantic_status"),
+                                    "coverage": initial_result.get("semantic_coverage"),
+                                    "reproductions": semantic_reproductions,
+                                },
+                            )
                     finally:
                         if log:
                             try:
@@ -1286,6 +1699,15 @@ class PageExplorer:
                             ),
                         )
                     self.storage.finish_page(page_id, "DONE")
+                    self.storage.record_qa_transition(
+                        self.run_id,
+                        page_id,
+                        "PAGE",
+                        "CLASSIFY",
+                        "REPORT",
+                        "页面探索完成，结果可进入报告",
+                        {"actions": actions},
+                    )
                     return {"page_id": page_id, "status": "DONE", "actions": actions}
                 finally:
                     browser.close()
@@ -1302,6 +1724,15 @@ class PageExplorer:
             else:
                 next_status = "LOAD_FAIL"
             self.storage.finish_page(page_id, next_status, error)
+            self.storage.record_qa_transition(
+                self.run_id,
+                page_id,
+                "PAGE_FAILURE",
+                "OBSERVE",
+                "CLASSIFY",
+                f"{classification.category}：{error}",
+                {"classification": classification.to_dict(), "next_status": next_status},
+            )
             self.storage.add_message(
                 self.run_id,
                 "error",

@@ -22,6 +22,39 @@
 10. 动作按 `READ_ONLY/UNKNOWN/STATEFUL/DESTRUCTIVE` 分类；持久化和高影响动作默认不执行。
 11. 只有可以证明安全重试的只读动作才会自动重试；动作已触发但结果不确定时标记为 `UNKNOWN_COMMIT`。
 12. 截图默认遮盖表单字段；URL、日志、报告和 PagePatrol 文本结果默认脱敏；Playwright trace 默认关闭。
+13. 起始页、子页面、动态跳转页及动作后的页面状态都必须经过统一语义观察；HTTP 200 不等于内容正确。
+14. 高可信内容异常在两个全新 BrowserContext 中复现后才确认为缺陷；低可信文案问题只进入人工确认。
+
+## 页面理解与语义 Oracle
+
+`semantic.required: true` 使语义判断成为每次页面观察后的必经阶段。系统先根据路由、HTML/ARIA 和页面结构推断列表、搜索、仪表盘、详情、表单、登录、错误页或空状态，再执行确定性 Oracle：
+
+- `CONTENT_UNAVAILABLE`：页面明确表示内容、接口或服务不可用；
+- `DATA_MISSING`：数据型页面的数据项为 0，并有失败证据；
+- `STUCK_LOADING`：等待窗口结束后仍存在可见 loading/skeleton；
+- `COPY_QUALITY`：乱码、异常裁切，或语义模型报告的不通顺文案；
+- `BUSINESS_MISMATCH`：违反显式结构化业务预期；
+- `ORACLE_UNCERTAIN`：存在异常迹象，但当前预期不足，不能直接报 Bug；
+- `SEMANTIC_CHECK_UNAVAILABLE`：已请求的模型不可用，不能静默算作语义通过。
+
+`expected_behavior` 支持来源、引用、条件、预期结果、禁止副作用和可信度。例如：
+
+```yaml
+expected_behavior:
+  - source: requirement:catalog-1
+    reference: 商品目录需求
+    conditions:
+      path_regex: /catalog
+      page_type: LIST
+    expected_result:
+      must_contain: 商品目录
+      min_items: 1
+      loading_must_finish: true
+    forbidden_side_effects: [不得创建或修改数据]
+    confidence: high
+```
+
+这些规则会同步到 `business_rules`，每次实际使用的规则、页面理解、观察证据与发现分别写入 `semantic_evaluations` 和 `semantic_findings`。主观的语句通顺度需要模型；项目通过 `semantic.model.provider: python` 和 `package.module:factory` 形式的本地适配器接入，不绑定特定供应商。传给适配器的正文、URL 和网络证据会先经过统一脱敏。若启用但适配器不可用，运行结果会进入 `NEEDS_REVIEW`。模型凭据不得写入 YAML，应由适配器从环境变量或系统凭据存储读取。
 
 ## 安全配置
 
@@ -71,7 +104,7 @@ python .\webqa_cli.py run --target https://staging.evomap.work/zh --max-depth 1
 - `arrival_path_json`：从主页到当前页面的完整点击历程。
 - `state_nodes.action_path_json`：当前页面内从初始状态到菜单、弹窗或 Tab 状态的动作组合。
 - `actions.full_path_json`：到达页面、进入状态并点击当前控件的完整历程。
-- 报告中的“业务流程线索”来自这些路径，只作为后续语义 Planner 的输入，不作为业务真值。
+- 报告中的“业务流程线索”来自这些路径，只作为语义判断的证据，不单独作为业务真值。
 
 ## 常用命令
 
@@ -114,6 +147,7 @@ webqa-output/
         ├── screenshots/
         ├── traces/
         ├── reproductions/
+        ├── semantic-reproductions/
         └── pagepatrol/
 ```
 
@@ -127,4 +161,5 @@ webqa-output/
 - 可见控件出现次数和去重后的控件队列；
 - 首次记录链接、重复链接、外域链接和深度边界；
 - 技术通过、风险跳过、表单规划、业务规则未确认、自动化未确认和阻塞项；
+- 页面类型、语义覆盖状态、Oracle 来源、预期/实际、置信度和双上下文复现结果；
 - PagePatrol 报告、截图以及完整点击历程。

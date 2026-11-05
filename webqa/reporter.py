@@ -244,6 +244,16 @@ class Reporter:
         visited_links = self.storage.scalar("SELECT COUNT(*) FROM link_visits WHERE run_id=?", (self.run_id,))
         edge_targets = self.storage.rows("SELECT DISTINCT target_url FROM page_edges WHERE run_id=?", (self.run_id,))
         recorded_same_host_links = sum(1 for row in edge_targets if same_host(run["target"], row["target_url"]))
+        semantic_evaluations = self.storage.rows(
+            "SELECT status,COUNT(*) n FROM semantic_evaluations WHERE run_id=? GROUP BY status",
+            (self.run_id,),
+        )
+        semantic_findings = self.storage.rows(
+            """SELECT sf.classification,COUNT(*) n FROM semantic_findings sf
+               JOIN semantic_evaluations se ON se.id=sf.evaluation_id
+               WHERE se.run_id=? GROUP BY sf.classification""",
+            (self.run_id,),
+        )
         return {
             "run": run,
             "pages": {row["status"]: row["n"] for row in pages},
@@ -254,6 +264,11 @@ class Reporter:
             "control_occurrences": self.storage.scalar("SELECT COUNT(*) FROM controls WHERE run_id=?", (self.run_id,)),
             "unique_controls": self.storage.scalar("SELECT COUNT(*) FROM frontier WHERE run_id=?", (self.run_id,)),
             "links": max(int(visited_links or 0), recorded_same_host_links),
+            "semantic_evaluations": {row["status"]: row["n"] for row in semantic_evaluations},
+            "semantic_findings": {row["classification"]: row["n"] for row in semantic_findings},
+            "qa_transitions": self.storage.scalar(
+                "SELECT COUNT(*) FROM qa_state_transitions WHERE run_id=?", (self.run_id,)
+            ),
         }
 
     def _artifact_reference(self, artifact: dict) -> tuple[str | None, str]:
@@ -335,6 +350,18 @@ class Reporter:
                WHERE b.run_id=? ORDER BY r.bug_id,r.attempt""",
             (self.run_id,),
         )
+        semantic_evaluations = self.storage.rows(
+            "SELECT * FROM semantic_evaluations WHERE run_id=? ORDER BY id", (self.run_id,)
+        )
+        semantic_findings = self.storage.rows(
+            """SELECT sf.*,se.page_id,se.phase,se.observed_url,se.page_type,se.coverage
+               FROM semantic_findings sf JOIN semantic_evaluations se ON se.id=sf.evaluation_id
+               WHERE se.run_id=? ORDER BY sf.id""",
+            (self.run_id,),
+        )
+        qa_transitions = self.storage.rows(
+            "SELECT * FROM qa_state_transitions WHERE run_id=? ORDER BY id", (self.run_id,)
+        )
         rounds = self.storage.rows(
             "SELECT * FROM run_rounds WHERE run_id=? ORDER BY round_no", (self.run_id,)
         )
@@ -375,6 +402,9 @@ class Reporter:
                 f"- 页面节点：{len(pages)}；页面状态：{len(states)}",
                 f"- 可见控件出现次数：{summary['control_occurrences']}；页面内去重后的待测控件：{summary['unique_controls']}",
                 f"- 已记录的同域目标链接：{summary['links']}；等待更深轮次解锁：{len(deferred_targets)}；表单边界用例：{len(test_cases)}",
+                f"- 语义观察：{len(semantic_evaluations)} 次；语义发现：{len(semantic_findings)} 项；"
+                f"分类：{'；'.join(f'{k} {v}' for k,v in summary['semantic_findings'].items()) or '无'}",
+                f"- QA 状态转换：{len(qa_transitions)} 条；主链：理解需求 → Oracle → 前置条件 → 执行 → 观察 → 分类 → 复现 → 报告",
                 f"- 页面状态分布：{'；'.join(f'{_status_cn(k)} {v}' for k,v in page_status.items()) or '无'}",
                 f"- 控件最终结果：{'；'.join(f'{_status_cn(k)} {v}' for k,v in action_status.items()) or '无'}",
                 "",
@@ -408,6 +438,49 @@ class Reporter:
             md.append("")
         else:
             md.append(f"| 已确认缺陷 | {len(confirmed_bugs)} | 仅统计两个全新 BrowserContext 中均稳定复现的问题 |")
+        md.extend(["", "## 可追溯 QA 状态机", ""])
+        md.append("`UNDERSTAND_REQUIREMENT → BUILD_ORACLE → PREPARE_PRECONDITIONS → EXECUTE → OBSERVE → CLASSIFY → REPRODUCE → REPORT`")
+        md.append("")
+        md.extend(
+            [
+                "| 页面 ID | 阶段 | 状态转换 | 原因 |",
+                "|---:|---|---|---|",
+            ]
+        )
+        for item in qa_transitions:
+            transition = f"{item.get('from_state') or 'START'} → {item['to_state']}"
+            md.append(
+                f"| {item['page_id']} | {_md(item['phase'])} | {_md(transition)} | {_md(item['reason'])} |"
+            )
+        md.extend(["", "## 页面理解与语义 Oracle", ""])
+        if not semantic_evaluations:
+            md.append("- 当前运行没有语义观察记录。")
+        else:
+            md.extend(
+                [
+                    "| 页面 | 阶段 | 页面类型 | 语义状态 | 覆盖 |",
+                    "|---|---|---|---|---|",
+                ]
+            )
+            for item in semantic_evaluations:
+                md.append(
+                    f"| {_md(item['observed_url'])} | {_md(item['phase'])} | {_md(item['page_type'])} | "
+                    f"{_md(item['status'])} | {_md(item['coverage'])} |"
+                )
+            md.append("")
+            if semantic_findings:
+                md.extend(
+                    [
+                        "| 分类 | 状态 | 置信度/严重度 | Oracle 来源 | 预期 | 实际 |",
+                        "|---|---|---|---|---|---|",
+                    ]
+                )
+                for finding in semantic_findings:
+                    md.append(
+                        f"| {_md(finding['classification'])} | {_md(finding['status'])} | "
+                        f"{_md(finding['confidence'])} / {_md(finding['severity'])} | "
+                        f"{_md(finding['oracle_source'])} | {_md(finding['expected'])} | {_md(finding['actual'])} |"
+                    )
         md.extend(
             [
                 "",
@@ -525,7 +598,7 @@ class Reporter:
                     md.append(f"- [{_status_cn(page['status'])}] {page['canonical_url']}：{page.get('load_error') or '未提供原因'}")
         md.extend(["", "## 缺陷独立复现", ""])
         if not bugs:
-            md.append("- 当前没有触发独立复现器的疑似页面脚本异常。")
+            md.append("- 当前没有触发独立复现器的疑似脚本或内容语义异常。")
         else:
             reproductions_by_bug: dict[int, list[dict]] = defaultdict(list)
             for item in reproductions:
@@ -533,10 +606,29 @@ class Reporter:
             for bug in bugs:
                 attempts = reproductions_by_bug.get(int(bug["id"]), [])
                 replayed = sum(int(item["reproduced"]) for item in attempts)
+                evidence = json_load(bug.get("first_evidence_json"), {})
                 md.append(
-                    f"- BUG-{bug['id']:04d} [{bug['status']}] {bug['title']}；独立复现 {replayed}/{len(attempts)}；"
-                    f"结论：{bug.get('triage') or '待复现'}；路径：{path_label(json_load(bug.get('shortest_path_json'), []))}"
+                    f"### BUG-{bug['id']:04d} [{bug['status']}] {bug['title']}"
                 )
+                md.append("")
+                md.append(f"- 严重度：{bug.get('severity') or 'unknown'}")
+                if evidence.get("classification"):
+                    md.append(f"- 异常分类：{evidence['classification']}")
+                if evidence.get("preconditions"):
+                    md.append(f"- 前置条件：{_md(evidence['preconditions'])}")
+                md.append(f"- 最小路径：{path_label(json_load(bug.get('shortest_path_json'), []))}")
+                if evidence.get("reproduction_steps"):
+                    md.append(f"- 复现步骤：{' → '.join(str(step) for step in evidence['reproduction_steps'])}")
+                if evidence.get("expected"):
+                    md.append(f"- 预期：{_md(evidence['expected'])}")
+                if evidence.get("actual"):
+                    md.append(f"- 实际：{_md(evidence['actual'])}")
+                if evidence.get("impact"):
+                    md.append(f"- 影响：{_md(evidence['impact'])}")
+                if evidence.get("confidence"):
+                    md.append(f"- 可信度：{_md(evidence['confidence'])}")
+                md.append(f"- 独立复现：{replayed}/{len(attempts)}；结论：{bug.get('triage') or '待复现'}")
+                md.append("")
         md.extend(["", "## 业务流程线索", ""])
         md.append("以下点击历程用于后续语义 Planner 推断业务流程；它们是证据，不是业务真值。")
         md.append("")

@@ -286,6 +286,60 @@ CREATE TABLE IF NOT EXISTS business_rules (
     UNIQUE(host, rule_key)
 );
 
+CREATE TABLE IF NOT EXISTS semantic_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    page_id INTEGER NOT NULL REFERENCES page_nodes(id),
+    state_id INTEGER REFERENCES state_nodes(id),
+    phase TEXT NOT NULL,
+    observed_url TEXT NOT NULL,
+    page_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    coverage TEXT NOT NULL,
+    observation_json TEXT NOT NULL,
+    understanding_json TEXT NOT NULL,
+    oracle_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_evaluations_page
+    ON semantic_evaluations(run_id,page_id,id);
+
+CREATE TABLE IF NOT EXISTS semantic_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_id INTEGER NOT NULL REFERENCES semantic_evaluations(id),
+    bug_id INTEGER REFERENCES bugs(id),
+    fingerprint TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    oracle_source TEXT NOT NULL,
+    expected TEXT NOT NULL,
+    actual TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(evaluation_id,fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_findings_classification
+    ON semantic_findings(classification,status,confidence);
+
+CREATE TABLE IF NOT EXISTS qa_state_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    page_id INTEGER NOT NULL REFERENCES page_nodes(id),
+    action_id INTEGER REFERENCES actions(id),
+    phase TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_qa_transitions_page
+    ON qa_state_transitions(run_id,page_id,id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL REFERENCES runs(id),
@@ -305,7 +359,7 @@ class Storage:
         self._local = threading.local()
         conn = self.connection()
         conn.executescript(SCHEMA)
-        conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version','3')")
+        conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version','4')")
         conn.commit()
 
     def connection(self) -> sqlite3.Connection:
@@ -1193,11 +1247,12 @@ class Storage:
         self,
         run_id: str,
         page_id: int,
-        action_id: int,
+        action_id: int | None,
         fingerprint: str,
         title: str,
         path: list,
         evidence: dict,
+        severity: str = "unknown",
     ) -> int:
         now = now_iso()
         with self.transaction() as conn:
@@ -1207,9 +1262,20 @@ class Storage:
             if row:
                 return int(row["id"])
             cur = conn.execute(
-                """INSERT INTO bugs(run_id,page_id,action_id,fingerprint,title,status,shortest_path_json,
-                   first_evidence_json,created_at,updated_at) VALUES(?,?,?,?,?,'SUSPECTED',?,?,?,?)""",
-                (run_id, page_id, action_id, fingerprint, title, json_text(path), json_text(evidence), now, now),
+                """INSERT INTO bugs(run_id,page_id,action_id,fingerprint,title,status,severity,shortest_path_json,
+                   first_evidence_json,created_at,updated_at) VALUES(?,?,?,?,?,'SUSPECTED',?,?,?,?,?)""",
+                (
+                    run_id,
+                    page_id,
+                    action_id,
+                    fingerprint,
+                    title,
+                    severity,
+                    json_text(path),
+                    json_text(evidence),
+                    now,
+                    now,
+                ),
             )
             return int(cur.lastrowid)
 
@@ -1246,6 +1312,159 @@ class Storage:
                 "UPDATE bugs SET status=?, triage=?, updated_at=? WHERE id=?",
                 (status, triage, now_iso(), bug_id),
             )
+
+    def upsert_business_rule(
+        self,
+        host: str,
+        rule_key: str,
+        rule_text: str,
+        status: str,
+        evidence: dict,
+    ) -> int:
+        now = now_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO business_rules(host,rule_key,rule_text,status,evidence_json,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(host,rule_key) DO UPDATE SET
+                     rule_text=excluded.rule_text,status=excluded.status,
+                     evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""",
+                (host, rule_key, rule_text, status, json_text(evidence), now, now),
+            )
+            row = conn.execute(
+                "SELECT id FROM business_rules WHERE host=? AND rule_key=?", (host, rule_key)
+            ).fetchone()
+            return int(row["id"])
+
+    def business_rules(self, host: str, *, status: str = "ACTIVE") -> list[dict]:
+        rows = self.rows(
+            "SELECT * FROM business_rules WHERE host=? AND status=? ORDER BY id", (host, status)
+        )
+        for row in rows:
+            row["evidence"] = json_load(row.get("evidence_json"), {})
+        return rows
+
+    def add_semantic_evaluation(
+        self,
+        run_id: str,
+        page_id: int,
+        phase: str,
+        observed_url: str,
+        observation: dict,
+        evaluation: dict,
+        *,
+        state_id: int | None = None,
+    ) -> tuple[int, list[dict]]:
+        now = now_iso()
+        understanding = evaluation.get("understanding") or {}
+        findings = evaluation.get("findings") or []
+        inserted: list[dict] = []
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """INSERT INTO semantic_evaluations(
+                     run_id,page_id,state_id,phase,observed_url,page_type,status,coverage,
+                     observation_json,understanding_json,oracle_json,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    page_id,
+                    state_id,
+                    phase,
+                    observed_url,
+                    understanding.get("primary_type") or "UNKNOWN",
+                    evaluation.get("status") or "NEEDS_REVIEW",
+                    evaluation.get("coverage") or "UNKNOWN",
+                    json_text(observation),
+                    json_text(understanding),
+                    json_text(evaluation.get("rules") or []),
+                    now,
+                ),
+            )
+            evaluation_id = int(cur.lastrowid)
+            for finding in findings:
+                fingerprint = str(finding.get("fingerprint") or sha(json_text(finding), 32))
+                previous = conn.execute(
+                    """SELECT sf.id,sf.status,sf.bug_id FROM semantic_findings sf
+                       JOIN semantic_evaluations se ON se.id=sf.evaluation_id
+                       WHERE se.run_id=? AND se.page_id=? AND sf.fingerprint=?
+                       ORDER BY sf.id LIMIT 1""",
+                    (run_id, page_id, fingerprint),
+                ).fetchone()
+                item_status = (
+                    "OBSERVED_AGAIN"
+                    if previous
+                    else ("SUSPECTED" if finding.get("bug_eligible") else "NEEDS_REVIEW")
+                )
+                item = dict(
+                    finding,
+                    fingerprint=fingerprint,
+                    status=item_status,
+                    previously_observed=bool(previous),
+                    previous_finding_id=int(previous["id"]) if previous else None,
+                )
+                finding_cur = conn.execute(
+                    """INSERT INTO semantic_findings(
+                         evaluation_id,fingerprint,classification,title,status,severity,confidence,
+                         oracle_source,expected,actual,evidence_json,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        evaluation_id,
+                        fingerprint,
+                        finding.get("classification") or "ORACLE_UNCERTAIN",
+                        finding.get("title") or "语义问题待确认",
+                        item_status,
+                        finding.get("severity") or "unknown",
+                        finding.get("confidence") or "low",
+                        finding.get("oracle_source") or "unknown",
+                        finding.get("expected") or "",
+                        finding.get("actual") or "",
+                        json_text(finding.get("evidence") or {}),
+                        now,
+                        now,
+                    ),
+                )
+                item["id"] = int(finding_cur.lastrowid)
+                item["evaluation_id"] = evaluation_id
+                inserted.append(item)
+        return evaluation_id, inserted
+
+    def finish_semantic_finding(self, finding_id: int, status: str, bug_id: int | None = None) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE semantic_findings SET status=?,bug_id=COALESCE(?,bug_id),updated_at=? WHERE id=?",
+                (status, bug_id, now_iso(), finding_id),
+            )
+
+    def record_qa_transition(
+        self,
+        run_id: str,
+        page_id: int,
+        phase: str,
+        from_state: str | None,
+        to_state: str,
+        reason: str,
+        evidence: dict | None = None,
+        *,
+        action_id: int | None = None,
+    ) -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """INSERT INTO qa_state_transitions(
+                     run_id,page_id,action_id,phase,from_state,to_state,reason,evidence_json,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    page_id,
+                    action_id,
+                    phase,
+                    from_state,
+                    to_state,
+                    reason,
+                    json_text(evidence or {}),
+                    now_iso(),
+                ),
+            )
+            return int(cur.lastrowid)
 
     def block_remaining_frontier(self, page_id: int, reason: str) -> int:
         with self.transaction() as conn:
