@@ -1,0 +1,66 @@
+version: 1
+target: https://staging.evomap.work
+
+scope:
+  same_host: true
+  # 主页为第 0 层；这里的值表示最多允许进入的子页面层数。
+  max_page_depth: 3
+  desktop_only: true
+  viewport:
+    width: 1440
+    height: 900
+
+expected_behavior:
+  - 页面内容与控件语义一致
+
+accounts:
+  mode: guest
+  storage_state: null
+
+test_data:
+  prefix: webqa-run-
+
+prohibited:
+  - payment
+  - delete
+  - publish
+  - oauth
+
+exclude:
+  - ai_answer_quality
+
+language: zh-CN
+
+traversal:
+  # 同一深度全部完成后，才开始下一层。
+  strategy: layered
+  parallel_pages: 3
+  max_pages: 500
+  max_states_per_page: 40
+  max_controls_per_state: 400
+  max_actions_per_page: 1200
+  action_timeout_ms: 8000
+  navigation_timeout_ms: 30000
+  settle_ms: 900
+  retry_limit: 2
+  # 点击出现新状态时，新控件进入当前页面队列最前面。
+  new_state_controls: front
+  # 同一运行中已点击过的目标链接只记录，不再点击。
+  duplicate_links: record_only
+  # 当前页只记录下一层链接；达到 max_page_depth 后才提升为标准页面测试。
+  # 后续用同一网址提高层数并续跑，会复用历史结果且不重测已完成页面。
+  child_page_check: record_only
+  history_scope: run
+
+pagepatrol:
+  enabled: true
+  executable: D:\KimiData\kimi\Workspaces\测试开发\pagepatrol-venv\Scripts\pagepatrol.exe
+  viewport: desktop
+  open_report: true
+  timeout_seconds: 180
+
+output:
+  directory: webqa-output
+  database: webqa.sqlite3
+  report_markdown: WebQA测试报告.md
+  report_html: WebQA测试报告.html
