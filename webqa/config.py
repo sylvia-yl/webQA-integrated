@@ -18,7 +18,7 @@ DEFAULTS: dict = {
         "desktop_only": True,
         "viewport": {"width": 1440, "height": 900},
     },
-    "accounts": {"mode": "guest", "storage_state": None},
+    "accounts": {"mode": "guest", "storage_state": None, "roles": {}},
     "test_data": {"prefix": "webqa-run-"},
     "prohibited": ["payment", "delete", "publish", "oauth"],
     "exclude": ["ai_answer_quality"],
@@ -39,6 +39,63 @@ DEFAULTS: dict = {
         "failure_patterns": [],
         "empty_state_patterns": [],
     },
+    "testing": {
+        "profile": "full",
+        "profiles": {
+            "smoke": {
+                "traversal": {
+                    "max_pages": 40,
+                    "max_states_per_page": 8,
+                    "max_controls_per_state": 120,
+                    "max_actions_per_page": 80,
+                },
+                "form_case_types": ["valid"],
+                "run_business_flows": True,
+                "run_invariants": True,
+                "list_item_samples": 1,
+                "pagination_samples": 3,
+            },
+            "full": {
+                "traversal": {},
+                "form_case_types": "all",
+                "run_business_flows": True,
+                "run_invariants": True,
+                "list_item_samples": 2,
+                "pagination_samples": 3,
+            },
+        },
+        "form_execution": {
+            "enabled": True,
+            "restore_original_value": True,
+        },
+        "invariants": {
+            "enabled": True,
+            "auto_detect": True,
+            "rules": [],
+        },
+        "list_sampling": {
+            "enabled": True,
+            "min_repeated_items": 6,
+            "item_detail_samples": 2,
+            "pagination_samples": 3,
+            "open_sampled_items": True,
+        },
+    },
+    "contracts": {
+        "api": {
+            "enabled": True,
+            "automatic_http_errors": True,
+            "capture_json_bytes": 262144,
+            "rules": [],
+        },
+        "ui": {
+            "enabled": True,
+            "automatic_title": True,
+            "automatic_accessible_names": True,
+            "rules": [],
+        },
+    },
+    "business_flows": [],
     "safety": {
         "allow_stateful_actions": False,
         "allow_destructive_actions": False,
@@ -88,6 +145,7 @@ DEFAULTS: dict = {
         "viewport": "desktop",
         "open_report": True,
         "timeout_seconds": 180,
+        "import_severities": ["error"],
     },
     "output": {
         "directory": "webqa-output",
@@ -220,6 +278,57 @@ def validate_config(config: dict) -> None:
         patterns = semantic.get(key)
         if not isinstance(patterns, list) or not all(isinstance(item, str) and item for item in patterns):
             raise ValueError(f"semantic.{key} 必须是字符串列表")
+    testing = config["testing"]
+    if testing.get("profile") not in {"smoke", "full"}:
+        raise ValueError("testing.profile 必须是 smoke 或 full")
+    profiles = testing.get("profiles")
+    if not isinstance(profiles, dict) or not {"smoke", "full"} <= set(profiles):
+        raise ValueError("testing.profiles 必须同时定义 smoke 和 full")
+    if not isinstance(testing.get("form_execution", {}).get("enabled"), bool):
+        raise ValueError("testing.form_execution.enabled 必须是布尔值")
+    if not isinstance(testing.get("invariants", {}).get("enabled"), bool):
+        raise ValueError("testing.invariants.enabled 必须是布尔值")
+    for profile_name, profile_settings in (testing.get("profiles") or {}).items():
+        for key in ("list_item_samples", "pagination_samples"):
+            if not 0 <= int(profile_settings.get(key, 0)) <= 10:
+                raise ValueError(f"testing.profiles.{profile_name}.{key} 必须在 0 到 10 之间")
+    list_sampling = testing.get("list_sampling") or {}
+    for key in ("enabled", "open_sampled_items"):
+        if not isinstance(list_sampling.get(key), bool):
+            raise ValueError(f"testing.list_sampling.{key} 必须是布尔值")
+    if not 3 <= int(list_sampling.get("min_repeated_items") or 0) <= 100:
+        raise ValueError("testing.list_sampling.min_repeated_items 必须在 3 到 100 之间")
+    for key in ("item_detail_samples", "pagination_samples"):
+        if not 0 <= int(list_sampling.get(key) or 0) <= 10:
+            raise ValueError(f"testing.list_sampling.{key} 必须在 0 到 10 之间")
+    contracts = config["contracts"]
+    for kind in ("api", "ui"):
+        if not isinstance(contracts.get(kind, {}).get("enabled"), bool):
+            raise ValueError(f"contracts.{kind}.enabled 必须是布尔值")
+        rules = contracts.get(kind, {}).get("rules")
+        if not isinstance(rules, list) or not all(isinstance(rule, dict) for rule in rules):
+            raise ValueError(f"contracts.{kind}.rules 必须是对象列表")
+    if not isinstance(config.get("business_flows"), list) or not all(
+        isinstance(flow, dict) for flow in config.get("business_flows") or []
+    ):
+        raise ValueError("business_flows 必须是对象列表")
+    patrol_severities = config["pagepatrol"].get("import_severities")
+    if not isinstance(patrol_severities, list) or not set(patrol_severities) <= {
+        "error",
+        "warning",
+        "info",
+    }:
+        raise ValueError("pagepatrol.import_severities 只能包含 error/warning/info")
+
+
+def apply_test_profile(config: dict, profile: str | None = None) -> None:
+    profile = str(profile or config.get("testing", {}).get("profile") or "full").lower()
+    if profile not in {"smoke", "full"}:
+        raise ValueError("测试模式必须是 smoke 或 full")
+    settings = config["testing"]["profiles"][profile]
+    config["testing"]["profile"] = profile
+    config["traversal"] = _merge(config["traversal"], settings.get("traversal") or {})
+    validate_config(config)
 
 
 def apply_overrides(

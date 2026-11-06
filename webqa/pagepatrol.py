@@ -20,11 +20,29 @@ def _sanitize_report_files(report_json: Path, report_html: Path, redactor: Redac
         try:
             raw = redactor.redact_value(json.loads(report_json.read_text(encoding="utf-8")))
             report_json.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-            findings = raw.get("findings") or []
+            findings: list[dict] = []
+            for viewport_result in raw.get("results") or []:
+                viewport = viewport_result.get("viewport") or {}
+                for finding in viewport_result.get("findings") or []:
+                    item = dict(finding)
+                    item["viewport"] = viewport
+                    item["fingerprint"] = sha(
+                        "|".join(
+                            [
+                                str(item.get("check") or ""),
+                                str(item.get("message") or ""),
+                                str(item.get("selector") or ""),
+                                str(viewport.get("name") or ""),
+                            ]
+                        ),
+                        32,
+                    )
+                    findings.append(item)
             result["finding_counts"] = {
                 level: sum(1 for item in findings if str(item.get("severity", "")).lower() == level)
                 for level in ("error", "warning", "info")
             }
+            result["findings"] = findings
         except Exception as exc:
             result["parse_error"] = redactor.redact_text(str(exc))
     if report_html.exists():
@@ -53,12 +71,18 @@ def run_pagepatrol(config: dict, output_dir: Path, url: str, page_id: int) -> di
     report_json = report_dir / "report.json"
     report_html = report_dir / "report.html"
     if report_json.exists():
-        return {
+        result = {
             "status": "DONE",
             "report_json": str(report_json),
             "report_html": str(report_html) if report_html.exists() else None,
             "reused": True,
         } | _sanitize_report_files(report_json, report_html, redactor)
+        allowed = {str(value).lower() for value in settings.get("import_severities") or ["error"]}
+        result["imported_findings"] = [
+            item for item in result.get("findings") or []
+            if str(item.get("severity") or "").lower() in allowed
+        ]
+        return result
     cmd = [
         str(executable),
         "check",
@@ -99,4 +123,9 @@ def run_pagepatrol(config: dict, output_dir: Path, url: str, page_id: int) -> di
     }
     if report_json.exists():
         result.update(_sanitize_report_files(report_json, report_html, redactor))
+        allowed = {str(value).lower() for value in settings.get("import_severities") or ["error"]}
+        result["imported_findings"] = [
+            item for item in result.get("findings") or []
+            if str(item.get("severity") or "").lower() in allowed
+        ]
     return redactor.redact_value(result)

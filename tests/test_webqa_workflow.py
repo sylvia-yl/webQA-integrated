@@ -6,6 +6,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from webqa.config import DEFAULTS
 from webqa.progress import ProgressTracker
@@ -18,8 +19,9 @@ HOME = b"""<!doctype html><html lang='en' class='dark'><head><title>Home</title>
 <style>#menu{display:none}.hidden{display:none}#shared-ai{position:fixed;right:12px;bottom:12px}</style></head><body>
 <header><button id='shared-global' aria-label='Global settings' onclick="if(!document.querySelector('#global-panel'))document.body.insertAdjacentHTML('beforeend','<p id=global-panel>global changed</p>')">Global settings</button><button id='shared-noop' aria-label='Shared no-op'>Shared no-op</button></header>
 <button id='shared-ai' aria-label='AI assistant' onclick="if(!document.querySelector('#ai-panel'))document.body.insertAdjacentHTML('beforeend','<div id=ai-panel role=dialog>AI panel</div>')">AI assistant</button>
-<main><button id='page-action' onclick="if(!document.querySelector('#page-result'))document.body.insertAdjacentHTML('beforeend','<p id=page-result>home action</p>')">Page action</button></main>
-<h1>Home</h1>
+<main><label for='nickname'>Nickname</label><input id='nickname' name='nickname' required minlength='2' maxlength='4'>
+<button id='page-action' onclick="if(!document.querySelector('#page-result'))document.body.insertAdjacentHTML('beforeend','<p id=page-result>home action</p>')">Page action</button></main>
+<h1>Home</h1><script>fetch('/api/status').then(r=>r.json()).then(v=>document.body.dataset.apiStatus=v.status)</script>
 <button id='toggle' aria-expanded='false' onclick="const m=document.querySelector('#menu');const open=m.style.display==='block';m.style.display=open?'none':'block';this.setAttribute('aria-expanded',String(!open))">Resources</button>
 <button id='theme' aria-label='Switch to light theme' onclick="const light=document.documentElement.classList.toggle('light');document.documentElement.classList.toggle('dark',!light);this.setAttribute('aria-label',light?'Switch to dark theme':'Switch to light theme')"><svg data-lucide='sun'></svg></button>
 <button id='boom' onclick="throw new Error('stable test error')">Broken action</button>
@@ -47,9 +49,48 @@ SEMANTIC_FAILURE = """<!doctype html><html lang='zh-CN'><head><title>排行榜</
 </body></html>""".encode("utf-8")
 
 
+def project_list(page_number: int) -> bytes:
+    start = (page_number - 1) * 8
+    items = "".join(
+        f"<li><a href='/projects/{index}'>Project {index}</a><button>More {index}</button></li>"
+        for index in range(start, start + 8)
+    )
+    pages = "".join(
+        (
+            f"<span aria-current='page'>{page}</span>"
+            if page == page_number
+            else f"<a href='/projects?page={page}'>{page}</a>"
+        )
+        for page in (1, 2, 10)
+    )
+    return (
+        "<!doctype html><html lang='en'><head><title>Projects</title></head><body>"
+        f"<main><h1>Projects</h1><ul id='projects'>{items}</ul>"
+        f"<nav class='pagination' aria-label='Pagination'>{pages}</nav></main>"
+        "</body></html>"
+    ).encode("utf-8")
+
+
+PROJECT_DETAIL = b"""<!doctype html><html lang='en'><head><title>Project detail</title></head>
+<body><main><h1>Project detail loaded</h1></main></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/semantic-failure"):
+        if self.path.startswith("/api/status"):
+            body = b'{"status":"ready","items":[{"id":1}]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/projects?") or self.path == "/projects":
+            query = parse_qs(urlsplit(self.path).query)
+            body = project_list(int((query.get("page") or ["1"])[0]))
+        elif self.path.startswith("/projects/"):
+            body = PROJECT_DETAIL
+        elif self.path.startswith("/semantic-failure"):
             body = SEMANTIC_FAILURE
         elif self.path.startswith("/child"):
             body = CHILD
@@ -96,6 +137,42 @@ class WorkflowTest(unittest.TestCase):
                 }
             )
             config["pagepatrol"]["enabled"] = False
+            config["contracts"]["api"]["rules"] = [
+                {
+                    "key": "status-api",
+                    "page_url_regex": "/$",
+                    "url_regex": "/api/status$",
+                    "statuses": [200],
+                    "content_types": ["application/json"],
+                    "required_fields": ["status", "items.*.id"],
+                    "enums": {"status": ["ready"]},
+                    "json_schema": {
+                        "type": "object",
+                        "required": ["status", "items"],
+                        "properties": {
+                            "status": {"type": "string"},
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["id"],
+                                },
+                            },
+                        },
+                    },
+                }
+            ]
+            config["business_flows"] = [
+                {
+                    "key": "home-smoke",
+                    "title": "主页只读冒烟流程",
+                    "profiles": ["smoke", "full"],
+                    "role": "guest",
+                    "given": [{"open": "/"}, {"assert": {"title_regex": "Home"}}],
+                    "when": [{"click": {"selector": "#page-action"}}],
+                    "then": [{"assert": {"text": "home action"}}],
+                }
+            ]
             config["output"]["directory"] = str(root / "output")
             config["output"]["database"] = str(root / "output" / "webqa.sqlite3")
             storage = Storage(config["output"]["database"])
@@ -130,6 +207,14 @@ class WorkflowTest(unittest.TestCase):
             self.assertIn("STATE_DISCOVERED", statuses)
             self.assertIn("TECH_PASS", statuses)
             self.assertIn("LINK_RECORDED", statuses)
+            self.assertIn(
+                "FORM_EXECUTED",
+                statuses,
+                storage.rows(
+                    "SELECT label,status,outcome,evidence_json FROM actions WHERE run_id=? ORDER BY id",
+                    (run_id,),
+                ),
+            )
             theme_actions = storage.rows(
                 "SELECT status,outcome FROM actions WHERE run_id=? AND label LIKE 'Switch to % theme%' AND status!='OBSERVED' ORDER BY id",
                 (run_id,),
@@ -147,6 +232,39 @@ class WorkflowTest(unittest.TestCase):
                     (bugs[0]["id"],),
                 ),
             )
+            self.assertGreater(
+                storage.scalar(
+                    "SELECT COUNT(*) FROM test_cases WHERE run_id=? AND status='PASS'",
+                    (run_id,),
+                ),
+                0,
+            )
+            self.assertEqual(
+                0,
+                storage.scalar(
+                    "SELECT COUNT(*) FROM contract_results WHERE run_id=? AND rule_key='status-api'",
+                    (run_id,),
+                ),
+            )
+            self.assertGreater(
+                storage.scalar(
+                    "SELECT COUNT(*) FROM semantic_evaluations WHERE run_id=? AND observation_json LIKE '%/api/status%'",
+                    (run_id,),
+                ),
+                0,
+            )
+            self.assertGreater(
+                storage.scalar(
+                    "SELECT COUNT(*) FROM invariant_results WHERE run_id=? AND status='PASS'",
+                    (run_id,),
+                ),
+                0,
+            )
+            flow = storage.rows(
+                "SELECT * FROM business_flow_results WHERE run_id=?", (run_id,)
+            )
+            self.assertEqual(1, len(flow))
+            self.assertEqual("PASS", flow[0]["status"])
             self.assertEqual(
                 0,
                 storage.scalar(
@@ -257,6 +375,7 @@ class WorkflowTest(unittest.TestCase):
             report = md_path.read_text(encoding="utf-8")
             self.assertIn("提高深度接续", report)
             self.assertIn("页面理解与语义 Oracle", report)
+            self.assertIn("Given/When/Then 业务流程", report)
             self.assertIn("Menu child", report)
             self.assertIn("Grandchild", report)
             self.assertIn("等待更深轮次解锁：1", report)
@@ -408,6 +527,74 @@ class WorkflowTest(unittest.TestCase):
                 "RETRY",
                 storage.rows("SELECT status FROM link_visits WHERE run_id=?", (run_id,))[0]["status"],
             )
+            storage.close_thread_connection()
+
+    def test_large_list_samples_two_items_and_first_middle_last_pages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = copy.deepcopy(DEFAULTS)
+            config["target"] = f"http://127.0.0.1:{self.server.server_port}/projects?page=1"
+            config["scope"]["max_page_depth"] = 0
+            config["traversal"].update(
+                {
+                    "parallel_pages": 2,
+                    "settle_ms": 60,
+                    "retry_limit": 1,
+                }
+            )
+            config["pagepatrol"]["enabled"] = False
+            config["output"]["directory"] = str(root / "output")
+            config["output"]["database"] = str(root / "output" / "webqa.sqlite3")
+            storage = Storage(config["output"]["database"])
+            run_id, _ = storage.create_or_resume_run(config, new_run=True)
+            run_dir = root / "output" / "runs" / run_id
+            LayeredRunner(
+                storage, run_id, config, run_dir, pagepatrol_enabled=False
+            ).run()
+
+            pages = storage.rows(
+                "SELECT canonical_url,depth,status FROM page_nodes WHERE run_id=? ORDER BY id",
+                (run_id,),
+            )
+            self.assertEqual(3, len(pages))
+            self.assertEqual({0}, {int(page["depth"]) for page in pages})
+            self.assertEqual({"DONE"}, {page["status"] for page in pages})
+            actions = storage.rows(
+                "SELECT status,label FROM actions WHERE run_id=? AND status IN "
+                "('PAGINATION_SAMPLE_PASS','LIST_SAMPLE_PASS') ORDER BY id",
+                (run_id,),
+            )
+            self.assertEqual(1, sum(item["status"] == "PAGINATION_SAMPLE_PASS" for item in actions))
+            self.assertEqual(2, sum(item["status"] == "LIST_SAMPLE_PASS" for item in actions))
+            self.assertEqual(
+                {"1", "5", "10"},
+                {
+                    (parse_qs(urlsplit(page["canonical_url"]).query).get("page") or ["1"])[0]
+                    for page in pages
+                },
+            )
+            self.assertEqual(
+                1,
+                storage.scalar(
+                    "SELECT COUNT(*) FROM page_edges WHERE run_id=? AND status='PAGINATION_INFERRED'",
+                    (run_id,),
+                ),
+            )
+            sampled_projects = storage.rows(
+                "SELECT target_url FROM link_visits WHERE run_id=? AND target_url LIKE '%/projects/%' ORDER BY target_url",
+                (run_id,),
+            )
+            self.assertEqual(
+                {"/projects/0", "/projects/79"},
+                {urlsplit(item["target_url"]).path for item in sampled_projects},
+            )
+            sampling = storage.rows(
+                "SELECT * FROM list_sampling_results WHERE run_id=? ORDER BY id", (run_id,)
+            )
+            self.assertEqual(6, len(sampling))
+            self.assertGreater(sum(int(item["skipped_count"]) for item in sampling), 40)
+            report = (run_dir / config["output"]["report_markdown"]).read_text(encoding="utf-8")
+            self.assertIn("## 列表与分页采样", report)
             storage.close_thread_connection()
 
 

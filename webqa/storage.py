@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterator
 from urllib.parse import urlsplit
 
-from .utils import canonical_url, json_load, json_text, now_iso
+from .utils import canonical_url, json_load, json_text, now_iso, sha
 
 
 OUTPUT_ROOT_RE = re.compile(r"[A-Za-z]:[\\/](?:[^\\/\r\n]+[\\/])*webqa-output", re.I)
@@ -340,6 +340,117 @@ CREATE TABLE IF NOT EXISTS qa_state_transitions (
 CREATE INDEX IF NOT EXISTS idx_qa_transitions_page
     ON qa_state_transitions(run_id,page_id,id);
 
+CREATE TABLE IF NOT EXISTS contract_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    page_id INTEGER NOT NULL REFERENCES page_nodes(id),
+    phase TEXT NOT NULL,
+    contract_type TEXT NOT NULL,
+    rule_key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    expected TEXT NOT NULL,
+    actual TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    occurrences INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id,page_id,fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_contract_results_run
+    ON contract_results(run_id,status,contract_type);
+
+CREATE TABLE IF NOT EXISTS external_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    page_id INTEGER NOT NULL REFERENCES page_nodes(id),
+    source TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    category TEXT NOT NULL,
+    check_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    selector TEXT,
+    evidence_json TEXT NOT NULL,
+    report_path TEXT,
+    occurrences INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id,page_id,source,fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_external_findings_run
+    ON external_findings(run_id,source,severity);
+
+CREATE TABLE IF NOT EXISTS invariant_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    page_id INTEGER NOT NULL REFERENCES page_nodes(id),
+    action_id INTEGER REFERENCES actions(id),
+    control_id INTEGER REFERENCES controls(id),
+    invariant_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    expected TEXT NOT NULL,
+    actual TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invariant_results_run
+    ON invariant_results(run_id,status,invariant_type);
+
+CREATE TABLE IF NOT EXISTS business_flow_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    flow_key TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    given_json TEXT NOT NULL,
+    when_json TEXT NOT NULL,
+    then_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    screenshot_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id,flow_key)
+);
+CREATE INDEX IF NOT EXISTS idx_business_flow_results_run
+    ON business_flow_results(run_id,status);
+
+CREATE TABLE IF NOT EXISTS sampling_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    group_key TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id,group_key,slot)
+);
+
+CREATE TABLE IF NOT EXISTS list_sampling_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    page_id INTEGER NOT NULL REFERENCES page_nodes(id),
+    state_id INTEGER NOT NULL REFERENCES state_nodes(id),
+    group_key TEXT NOT NULL,
+    sample_kind TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    visible_items INTEGER NOT NULL,
+    visible_controls INTEGER NOT NULL,
+    selected_count INTEGER NOT NULL,
+    skipped_count INTEGER NOT NULL,
+    selected_json TEXT NOT NULL,
+    page_context_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(state_id,group_key,sample_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_list_sampling_run
+    ON list_sampling_results(run_id,sample_kind,page_id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL REFERENCES runs(id),
@@ -359,7 +470,7 @@ class Storage:
         self._local = threading.local()
         conn = self.connection()
         conn.executescript(SCHEMA)
-        conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version','4')")
+        conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version','6')")
         conn.commit()
 
     def connection(self) -> sqlite3.Connection:
@@ -406,6 +517,18 @@ class Storage:
                     (target,),
                 ).fetchone()
                 if latest:
+                    previous_config = json_load(latest["config_json"], {})
+                    previous_profile = str(
+                        (previous_config.get("testing") or {}).get("profile") or "full"
+                    )
+                    requested_profile = str(
+                        (config.get("testing") or {}).get("profile") or "full"
+                    )
+                    if requested_profile != previous_profile:
+                        raise ValueError(
+                            f"续跑不能把测试模式从 {previous_profile} 改为 {requested_profile}；"
+                            "模式决定已完成页面的用例覆盖，请新建实例"
+                        )
                     previous_depth = int(latest["max_depth"])
                     if requested_depth < previous_depth:
                         raise ValueError(
@@ -891,6 +1014,8 @@ class Storage:
                     continue
                 inserted += 1
                 control_id = int(cur.lastrowid)
+                if item.get("sampling_decision") == "skip":
+                    continue
                 existing = conn.execute(
                     "SELECT id FROM frontier WHERE page_id=? AND behavior_key=?",
                     (page_id, item["behavior_key"]),
@@ -906,6 +1031,50 @@ class Storage:
                 )
                 queued += 1
         return inserted, queued
+
+    def claim_sampling_slot(self, run_id: str, group_key: str, slot: str) -> bool:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO sampling_claims(run_id,group_key,slot,created_at) VALUES(?,?,?,?)",
+                (run_id, group_key, slot, now_iso()),
+            )
+            return cur.rowcount == 1
+
+    def add_list_sampling_results(
+        self,
+        run_id: str,
+        page_id: int,
+        state_id: int,
+        results: list[dict],
+    ) -> int:
+        now = now_iso()
+        inserted = 0
+        with self.transaction() as conn:
+            for result in results:
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO list_sampling_results(
+                         run_id,page_id,state_id,group_key,sample_kind,strategy,visible_items,
+                         visible_controls,selected_count,skipped_count,selected_json,
+                         page_context_json,created_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id,
+                        page_id,
+                        state_id,
+                        result.get("group_key") or "",
+                        result.get("sample_kind") or "UNKNOWN",
+                        result.get("strategy") or "",
+                        int(result.get("visible_items") or 0),
+                        int(result.get("visible_controls") or 0),
+                        int(result.get("selected_count") or 0),
+                        int(result.get("skipped_count") or 0),
+                        json_text(result.get("selected") or []),
+                        json_text(result.get("page_context") or {}),
+                        now,
+                    ),
+                )
+                inserted += int(cur.rowcount == 1)
+        return inserted
 
     def claim_frontier(self, page_id: int, retry_limit: int) -> dict | None:
         with self.transaction() as conn:
@@ -1223,8 +1392,17 @@ class Storage:
         cases: list[dict],
     ) -> int:
         now = now_iso()
+        inserted = 0
         with self.transaction() as conn:
             for case in cases:
+                input_json = json_text({"value": case.get("value")})
+                existing = conn.execute(
+                    """SELECT id FROM test_cases
+                       WHERE run_id=? AND control_id=? AND case_type=? AND input_json=?""",
+                    (run_id, control_id, case["case_type"], input_json),
+                ).fetchone()
+                if existing:
+                    continue
                 conn.execute(
                     """INSERT INTO test_cases(run_id,page_id,state_id,control_id,source,case_type,
                        input_json,expected,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
@@ -1235,13 +1413,14 @@ class Storage:
                         control_id,
                         "html_constraints",
                         case["case_type"],
-                        json_text({"value": case.get("value")}),
+                        input_json,
                         case["expected"],
                         "PLANNED",
                         now,
                     ),
                 )
-        return len(cases)
+                inserted += 1
+        return inserted
 
     def create_bug_candidate(
         self,
@@ -1433,6 +1612,196 @@ class Storage:
             conn.execute(
                 "UPDATE semantic_findings SET status=?,bug_id=COALESCE(?,bug_id),updated_at=? WHERE id=?",
                 (status, bug_id, now_iso(), finding_id),
+            )
+
+    def add_contract_results(
+        self,
+        run_id: str,
+        page_id: int,
+        phase: str,
+        results: list[dict],
+    ) -> list[dict]:
+        now = now_iso()
+        stored: list[dict] = []
+        with self.transaction() as conn:
+            for result in results:
+                fingerprint = str(result.get("fingerprint") or sha(json_text(result), 32))
+                conn.execute(
+                    """INSERT INTO contract_results(
+                         run_id,page_id,phase,contract_type,rule_key,fingerprint,status,severity,
+                         title,expected,actual,evidence_json,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(run_id,page_id,fingerprint) DO UPDATE SET
+                         phase=excluded.phase,status=excluded.status,severity=excluded.severity,
+                         actual=excluded.actual,evidence_json=excluded.evidence_json,
+                         occurrences=contract_results.occurrences+1,updated_at=excluded.updated_at""",
+                    (
+                        run_id,
+                        page_id,
+                        phase,
+                        result.get("contract_type") or "UNKNOWN",
+                        result.get("rule_key") or "unknown",
+                        fingerprint,
+                        result.get("status") or "UNCONFIRMED",
+                        result.get("severity") or "unknown",
+                        result.get("title") or "契约检查结果",
+                        result.get("expected") or "",
+                        result.get("actual") or "",
+                        json_text(result.get("evidence") or {}),
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute(
+                    """SELECT * FROM contract_results
+                       WHERE run_id=? AND page_id=? AND fingerprint=?""",
+                    (run_id, page_id, fingerprint),
+                ).fetchone()
+                stored.append(dict(row))
+        return stored
+
+    def add_external_findings(
+        self,
+        run_id: str,
+        page_id: int,
+        source: str,
+        findings: list[dict],
+        report_path: str | None = None,
+    ) -> int:
+        now = now_iso()
+        with self.transaction() as conn:
+            for finding in findings:
+                fingerprint = str(finding.get("fingerprint") or sha(json_text(finding), 32))
+                conn.execute(
+                    """INSERT INTO external_findings(
+                         run_id,page_id,source,fingerprint,severity,category,check_key,title,
+                         selector,evidence_json,report_path,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(run_id,page_id,source,fingerprint) DO UPDATE SET
+                         evidence_json=excluded.evidence_json,report_path=excluded.report_path,
+                         occurrences=external_findings.occurrences+1,updated_at=excluded.updated_at""",
+                    (
+                        run_id,
+                        page_id,
+                        source,
+                        fingerprint,
+                        finding.get("severity") or "unknown",
+                        finding.get("category") or "unknown",
+                        finding.get("check") or "unknown",
+                        finding.get("message") or finding.get("title") or "外部审计发现",
+                        finding.get("selector"),
+                        json_text(finding),
+                        report_path,
+                        now,
+                        now,
+                    ),
+                )
+        return len(findings)
+
+    def add_invariant_result(
+        self,
+        run_id: str,
+        page_id: int,
+        invariant_type: str,
+        source: str,
+        confidence: str,
+        status: str,
+        title: str,
+        expected: str,
+        actual: str,
+        evidence: dict,
+        *,
+        action_id: int | None = None,
+        control_id: int | None = None,
+    ) -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """INSERT INTO invariant_results(
+                     run_id,page_id,action_id,control_id,invariant_type,source,confidence,status,
+                     title,expected,actual,evidence_json,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    page_id,
+                    action_id,
+                    control_id,
+                    invariant_type,
+                    source,
+                    confidence,
+                    status,
+                    title,
+                    expected,
+                    actual,
+                    json_text(evidence),
+                    now_iso(),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def business_flow_result(self, run_id: str, flow_key: str) -> dict | None:
+        row = self.connection().execute(
+            "SELECT * FROM business_flow_results WHERE run_id=? AND flow_key=?",
+            (run_id, flow_key),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def add_business_flow_result(
+        self,
+        run_id: str,
+        flow_key: str,
+        profile: str,
+        role: str,
+        status: str,
+        title: str,
+        given: list,
+        when: list,
+        then: list,
+        result: dict,
+        screenshot_path: str | None = None,
+    ) -> int:
+        now = now_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO business_flow_results(
+                     run_id,flow_key,profile,role,status,title,given_json,when_json,then_json,
+                     result_json,screenshot_path,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(run_id,flow_key) DO UPDATE SET
+                     status=excluded.status,result_json=excluded.result_json,
+                     screenshot_path=excluded.screenshot_path,updated_at=excluded.updated_at""",
+                (
+                    run_id,
+                    flow_key,
+                    profile,
+                    role,
+                    status,
+                    title,
+                    json_text(given),
+                    json_text(when),
+                    json_text(then),
+                    json_text(result),
+                    screenshot_path,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM business_flow_results WHERE run_id=? AND flow_key=?",
+                (run_id, flow_key),
+            ).fetchone()
+            return int(row["id"])
+
+    def planned_test_cases(self, control_id: int) -> list[dict]:
+        return self.rows(
+            "SELECT * FROM test_cases WHERE control_id=? AND status='PLANNED' ORDER BY id",
+            (control_id,),
+        )
+
+    def finish_test_case(self, case_id: int, status: str, result: dict) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE test_cases SET status=?,result_json=? WHERE id=?",
+                (status, json_text(result), case_id),
             )
 
     def record_qa_transition(

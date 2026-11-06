@@ -31,12 +31,16 @@ do {
     if (-not $DepthOk) { Write-Host "层数必须是 0 到 20 的整数。" -ForegroundColor Yellow }
 } until ($DepthOk)
 
+$ProfileInput = (Read-Host "选择测试模式：S 冒烟测试；F 全量测试（默认 F）").Trim().ToUpperInvariant()
+$Profile = if ($ProfileInput -eq "S") { "smoke" } else { "full" }
+
 $Mode = (Read-Host "输入 N 新建实例；输入 R 接续最近实例（可提高层数，默认 N）").Trim().ToUpperInvariant()
-$Arguments = @($Entry, "run", "--target", $TargetUrl, "--max-depth", "$Depth")
+$Arguments = @($Entry, "run", "--target", $TargetUrl, "--max-depth", "$Depth", "--profile", $Profile)
 if ($Mode -ne "R") { $Arguments += "--new-run" }
 
 Write-Host ""
 Write-Host "测试开始。R 会沿用原运行 ID 和结果；提高层数时只测试新解锁页面。" -ForegroundColor Green
+Write-Host "测试模式：$Profile" -ForegroundColor Green
 Write-Host "按 Ctrl+C 可安全暂停，之后选择 R 可继续。" -ForegroundColor Green
 Write-Host ""
 & $Runtime @Arguments

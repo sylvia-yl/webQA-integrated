@@ -24,7 +24,7 @@ INTERACTIVE_SELECTOR = ",".join(
 
 
 COLLECT_JS = r"""
-({selector, includeSelectors = [], excludeSelectors = []}) => {
+({selector, includeSelectors = [], excludeSelectors = [], listSampling = {}}) => {
   const compact = value => (value || '').replace(/\s+/g, ' ').trim();
   const matchedSelector = (el, selectors) => selectors.find(value => {
     try { return el.matches(value); } catch (_) { return false; }
@@ -167,6 +167,75 @@ COLLECT_JS = r"""
     return compact(landmark.querySelector('h1,h2,h3')?.innerText || landmark.tagName.toLowerCase());
   };
   const roleOf = el => el.getAttribute('role') || ({A:'link',BUTTON:'button',SUMMARY:'button',SELECT:'combobox',TEXTAREA:'textbox'}[el.tagName] || (el.tagName === 'INPUT' ? (['button','submit','reset'].includes(el.type) ? 'button' : 'textbox') : ''));
+  const paginationRootSelector = [
+    '[aria-label*="pagination" i]','[aria-label*="分页"]','[class*="pagination" i]',
+    '[data-testid*="pagination" i]','[data-test*="pagination" i]'
+  ].join(',');
+  const paginationRoots = Array.from(document.querySelectorAll(paginationRootSelector)).filter(rendered);
+  const paginationRootFor = el => el.closest(paginationRootSelector);
+  const pageNumber = value => {
+    const match = compact(value).match(/^\s*(\d+)\s*$/);
+    return match ? Number(match[1]) : null;
+  };
+  const paginationNumbers = paginationRoots.flatMap(root =>
+    Array.from(root.querySelectorAll('a,button,[role="link"],[role="button"],[aria-current="page"]'))
+      .filter(rendered).map(el => ({el, number: pageNumber(accessibleName(el))})).filter(item => item.number !== null)
+  );
+  const currentNumberNode = paginationNumbers.find(item =>
+    item.el.getAttribute('aria-current') === 'page' || /(^|\s)(active|selected|current)(\s|$)/i.test(item.el.className || '')
+  );
+  const urlPageNumber = (() => {
+    const params = new URLSearchParams(location.search);
+    for (const key of ['page','p','pageIndex','page_index','pageNum','page_num','pageNo','page_no']) {
+      const value = params.get(key);
+      if (value && /^\d+$/.test(value)) return Number(value);
+    }
+    const match = location.pathname.match(/\/page\/(\d+)(?:\/|$)/i);
+    return match ? Number(match[1]) : null;
+  })();
+  const observedPageNumbers = paginationNumbers.map(item => item.number);
+  const pagePagination = {
+    first: observedPageNumbers.length ? Math.min(...observedPageNumbers) : null,
+    current: currentNumberNode?.number ?? urlPageNumber,
+    last: observedPageNumbers.length ? Math.max(...observedPageNumbers) : null,
+  };
+  const repeatedContext = el => {
+    if (paginationRootFor(el) || el.closest('header,footer,nav,[role="navigation"],[role="menu"]')) return null;
+    const item = el.closest('tbody > tr,[role="row"],li,[role="listitem"],article,[class~="card"],[data-testid*="card" i]');
+    if (!item || !item.parentElement) return null;
+    const role = item.getAttribute('role') || '';
+    const siblings = Array.from(item.parentElement.children).filter(candidate => {
+      if (!rendered(candidate)) return false;
+      if (role) return candidate.getAttribute('role') === role;
+      return candidate.tagName === item.tagName;
+    });
+    const minimum = Math.max(3, Number(listSampling.min_repeated_items || 6));
+    if (siblings.length < minimum) return null;
+    const root = item.parentElement;
+    const rootSignature = [
+      root.tagName.toLowerCase(), root.getAttribute('role') || '', root.id || '', testId(root),
+      compact(root.getAttribute('aria-label')), Array.from(root.classList || []).sort().slice(0, 5).join('.')
+    ].join('|').slice(0, 500);
+    return {key: rootSignature, index: siblings.indexOf(item), count: siblings.length};
+  };
+  const paginationContext = (el, href) => {
+    const root = paginationRootFor(el);
+    if (!root) return null;
+    const label = accessibleName(el);
+    const clue = compact([label, el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('rel')].join(' ')).toLowerCase();
+    const number = pageNumber(label);
+    let kind = number !== null ? 'page' : '';
+    if (/^(first|首页|第一页)|\bfirst\b/.test(clue)) kind = 'first';
+    else if (/^(last|末页|尾页|最后一页)|\blast\b/.test(clue)) kind = 'last';
+    else if (/^(next|下一页|下页)|\bnext\b/.test(clue) || el.getAttribute('rel') === 'next') kind = 'next';
+    else if (/^(prev|previous|上一页|上页)|\b(prev|previous)\b/.test(clue) || el.getAttribute('rel') === 'prev') kind = 'previous';
+    else if (el.getAttribute('aria-current') === 'page') kind = 'current';
+    const rootSignature = [
+      root.tagName.toLowerCase(), root.getAttribute('role') || '', root.id || '', testId(root),
+      compact(root.getAttribute('aria-label')), Array.from(root.classList || []).sort().slice(0, 5).join('.')
+    ].join('|').slice(0, 500);
+    return {key: rootSignature, kind, number, href};
+  };
   return Array.from(document.querySelectorAll(selector)).map((el, domIndex) => {
     if (!rendered(el)) return null;
     let href = el.href || el.getAttribute('data-href') || '';
@@ -196,6 +265,8 @@ COLLECT_JS = r"""
     }
     const visualControl = ['BUTTON','A','SUMMARY'].includes(el.tagName) || ['button','link','tab','menuitem'].includes(roleOf(el));
     const shared = sharedContext(el);
+    const repeated = repeatedContext(el);
+    const pagination = paginationContext(el, href);
     return {
       tag: el.tagName.toLowerCase(),
       role: roleOf(el),
@@ -221,6 +292,15 @@ COLLECT_JS = r"""
       checked: typeof el.checked === 'boolean' ? el.checked : null,
       selected: el.tagName === 'SELECT' ? el.value : null,
       section: section(el).slice(0, 160),
+      collection_key_hint: repeated?.key || '',
+      collection_item_index: repeated?.index ?? null,
+      collection_item_count: repeated?.count ?? null,
+      pagination_key_hint: pagination?.key || '',
+      pagination_kind: pagination?.kind || '',
+      pagination_page_number: pagination?.number ?? null,
+      pagination_first_page: pagePagination.first,
+      pagination_current_page: pagePagination.current,
+      pagination_last_page: pagePagination.last,
       shared_scope: shared.scope,
       shared_container_signature: shared.signature,
       shared_forced: shared.forced,
@@ -231,7 +311,12 @@ COLLECT_JS = r"""
         required: !!el.required,
         min: el.getAttribute('min'), max: el.getAttribute('max'), step: el.getAttribute('step'),
         minlength: el.getAttribute('minlength'), maxlength: el.getAttribute('maxlength'),
-        pattern: el.getAttribute('pattern'), autocomplete: el.getAttribute('autocomplete')
+        pattern: el.getAttribute('pattern'), autocomplete: el.getAttribute('autocomplete'),
+        options: el.tagName === 'SELECT' ? Array.from(el.options).map(option => ({
+          value: option.value,
+          label: compact(option.textContent),
+          disabled: option.disabled
+        })).slice(0, 100) : []
       }
     };
   }).filter(Boolean);
@@ -399,14 +484,17 @@ def collect_controls(
     base_url: str,
     max_controls: int,
     shared_rules: dict | None = None,
+    list_sampling_rules: dict | None = None,
 ) -> list[dict]:
     shared_rules = shared_rules or {}
+    list_sampling_rules = list_sampling_rules or {}
     raw = page.evaluate(
         COLLECT_JS,
         {
             "selector": INTERACTIVE_SELECTOR,
             "includeSelectors": shared_rules.get("include_selectors") or [],
             "excludeSelectors": shared_rules.get("exclude_selectors") or [],
+            "listSampling": list_sampling_rules,
         },
     )
     return enrich_controls(base_url, raw[:max_controls])
@@ -417,9 +505,10 @@ def snapshot(
     base_url: str,
     max_controls: int,
     shared_rules: dict | None = None,
+    list_sampling_rules: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     content = page.evaluate(SNAPSHOT_JS)
-    controls = collect_controls(page, base_url, max_controls, shared_rules)
+    controls = collect_controls(page, base_url, max_controls, shared_rules, list_sampling_rules)
     control_state = sorted({item["semantic_key"] for item in controls})
     stable = {
         "url": canonical_url(base_url, content.get("url") or base_url),

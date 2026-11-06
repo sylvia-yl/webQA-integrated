@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -8,6 +9,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .browser import action_step, locate_control, observable_delta, snapshot
+from .contracts import evaluate_api_contracts, evaluate_ui_contracts
+from .invariants import page_structure_profile, select_invariant, visible_collection_snapshot
+from .list_sampling import apply_list_sampling
 from .pagepatrol import run_pagepatrol
 from .planner_rules import plan_field_cases
 from .semantic import (
@@ -38,14 +42,16 @@ class ActionAttemptError(RuntimeError):
 
 
 class EventLog:
-    def __init__(self, page, redactor: Redactor):
+    def __init__(self, page, redactor: Redactor, *, capture_json_bytes: int = 262144):
         self.console_errors: list[str] = []
         self.page_errors: list[str] = []
         self.failed_requests: list[str] = []
         self.responses: list[dict] = []
         self.response_errors: list[str] = []
+        self.api_responses: list[dict] = []
         self.page = page
         self.redactor = redactor
+        self.capture_json_bytes = max(0, int(capture_json_bytes))
         self._callbacks = {
             "console": self._console,
             "pageerror": self._page_error,
@@ -74,6 +80,33 @@ class EventLog:
                 self.responses.append({"url": response.url, "status": response.status})
             if response.status >= 400 and resource_type in {"document", "xhr", "fetch"}:
                 self.response_errors.append(f"{response.status} {resource_type} {response.url}"[:1000])
+            if resource_type in {"xhr", "fetch"} and len(self.api_responses) < 100:
+                headers = response.headers
+                content_type = str(headers.get("content-type") or "")
+                entry = {
+                    "method": response.request.method,
+                    "url": response.url,
+                    "status": response.status,
+                    "content_type": content_type,
+                    "resource_type": resource_type,
+                }
+                length_text = headers.get("content-length")
+                try:
+                    content_length = int(length_text) if length_text else None
+                except ValueError:
+                    content_length = None
+                if "json" in content_type.lower() and (
+                    content_length is None or content_length <= self.capture_json_bytes
+                ):
+                    try:
+                        body = response.body()
+                        if len(body) <= self.capture_json_bytes:
+                            entry["json"] = json.loads(body.decode("utf-8", errors="replace"))
+                        else:
+                            entry["body_error"] = f"JSON 正文超过采集上限 {self.capture_json_bytes} 字节"
+                    except Exception as exc:
+                        entry["body_error"] = f"{type(exc).__name__}: {exc}"
+                self.api_responses.append(self.redactor.redact_value(entry))
         except Exception:
             pass
 
@@ -91,6 +124,7 @@ class EventLog:
             "failed_requests": self.failed_requests[:10],
             "document_responses": self.responses[-10:],
             "response_errors": self.response_errors[:10],
+            "api_responses": self.api_responses[:100],
         })
 
     def clear(self) -> None:
@@ -99,6 +133,7 @@ class EventLog:
         self.failed_requests.clear()
         self.responses.clear()
         self.response_errors.clear()
+        self.api_responses.clear()
 
 
 class PageExplorer:
@@ -143,6 +178,10 @@ class PageExplorer:
         self.shared_settings = (
             (config.get("deduplication") or {}).get("shared_controls") or {}
         )
+        testing = config.get("testing") or {}
+        self.test_profile = str(testing.get("profile") or "full")
+        self.profile_settings = (testing.get("profiles") or {}).get(self.test_profile) or {}
+        self.list_sampling_settings = testing.get("list_sampling") or {}
         self.shared_context_key = sha(
             json_text(
                 {
@@ -163,6 +202,8 @@ class PageExplorer:
                         )
                     },
                     "shared_controls": self.shared_settings,
+                    "test_profile": self.test_profile,
+                    "list_sampling": self.list_sampling_settings,
                 }
             ),
             32,
@@ -184,6 +225,14 @@ class PageExplorer:
         context.set_default_timeout(int(self.settings["action_timeout_ms"]))
         return context
 
+    def _event_log(self, page) -> EventLog:
+        api_settings = (self.config.get("contracts") or {}).get("api") or {}
+        return EventLog(
+            page,
+            self.redactor,
+            capture_json_bytes=int(api_settings.get("capture_json_bytes") or 262144),
+        )
+
     def _settle(self, page) -> None:
         try:
             page.wait_for_load_state("domcontentloaded", timeout=3000)
@@ -197,7 +246,7 @@ class PageExplorer:
 
     def _open(self, context, url: str):
         page = context.new_page()
-        log = EventLog(page, self.redactor)
+        log = self._event_log(page)
         response = page.goto(url, wait_until="domcontentloaded", timeout=int(self.settings["navigation_timeout_ms"]))
         self._settle(page)
         return page, response, log
@@ -208,6 +257,7 @@ class PageExplorer:
             self.target,
             int(self.settings["max_controls_per_state"]),
             self.shared_settings,
+            self.list_sampling_settings,
         )
         return self.redactor.redact_value(snap), self.redactor.redact_value(controls)
 
@@ -323,6 +373,65 @@ class PageExplorer:
         )
         queued = 0
         if state_id is not None and is_new:
+            controls, sampling_results = apply_list_sampling(
+                controls,
+                snap.get("url") or page.url,
+                self.list_sampling_settings,
+                self.profile_settings,
+                lambda group_key, slot: self.storage.claim_sampling_slot(
+                    self.run_id, group_key, slot
+                ),
+            )
+            if sampling_results:
+                self.storage.add_list_sampling_results(
+                    self.run_id,
+                    int(page_row["id"]),
+                    state_id,
+                    self.redactor.redact_value(sampling_results),
+                )
+                arrival_path = json_load(page_row.get("arrival_path_json"), [])
+                for sampling_result in sampling_results:
+                    for direct in sampling_result.get("direct_targets") or []:
+                        target = canonical_url(self.target, str(direct.get("href") or ""))
+                        if (
+                            not target
+                            or not same_host(self.target, target)
+                            or target == canonical_url(self.target, snap.get("url") or page.url)
+                            or self._page_count() >= int(self.settings["max_pages"])
+                        ):
+                            continue
+                        path = arrival_path + [
+                            {
+                                "label": f"分页采样直达「{direct.get('page') or direct.get('label') or target}」",
+                                "url": target,
+                            }
+                        ]
+                        target_page_id, created = self.storage.add_page(
+                            self.run_id,
+                            target,
+                            int(page_row["depth"]),
+                            path,
+                            int(page_row["id"]),
+                            None,
+                        )
+                        if created:
+                            self.storage.add_edge(
+                                self.run_id,
+                                int(page_row["id"]),
+                                state_id,
+                                None,
+                                target,
+                                "PAGINATION_INFERRED",
+                                path,
+                                target_page_id=target_page_id,
+                            )
+                            self.storage.add_message(
+                                self.run_id,
+                                "info",
+                                "list_sampling",
+                                f"根据已验证分页 URL 模式加入中间代表页：{target}",
+                                {"group_key": sampling_result.get("group_key"), "page": direct.get("page")},
+                            )
             arrival = json_load(page_row.get("arrival_path_json"), [])
             readable_steps = [{"label": step.get("label") or "未命名动作"} for step in action_path]
             _, queued = self.storage.add_controls(
@@ -456,6 +565,21 @@ class PageExplorer:
             model_observation=model_observation,
         )
         evaluation_data = self.redactor.redact_value(evaluation.to_dict())
+        contract_settings = self.config.get("contracts") or {}
+        contract_findings = evaluate_ui_contracts(
+            page,
+            observation.url,
+            contract_settings.get("ui") or {},
+        )
+        contract_findings.extend(
+            evaluate_api_contracts(
+                event_evidence.get("api_responses") or [],
+                contract_settings.get("api") or {},
+                phase=phase,
+                page_url=observation.url,
+            )
+        )
+        contract_findings = self.redactor.redact_value(contract_findings)
         evaluation_id = None
         finding_records = evaluation_data.get("findings") or []
         if persist:
@@ -481,6 +605,13 @@ class PageExplorer:
                     "finding_count": len(finding_records),
                 },
             )
+            if contract_findings:
+                self.storage.add_contract_results(
+                    self.run_id,
+                    page_id,
+                    phase,
+                    contract_findings,
+                )
 
         reasons: list[str] = []
         if http_status is not None and http_status >= 400:
@@ -509,6 +640,16 @@ class PageExplorer:
         reasons.extend(
             f"{finding.get('classification')}：{finding.get('actual')}"
             for finding in blocking_semantic
+        )
+        blocking_contracts = [
+            finding
+            for finding in contract_findings
+            if finding.get("status") == "FAIL"
+            and finding.get("severity") in {"critical", "major"}
+        ]
+        reasons.extend(
+            f"{finding.get('contract_type')}_CONTRACT：{finding.get('actual')}"
+            for finding in blocking_contracts
         )
         headings = observation.headings or []
         return {
@@ -553,6 +694,7 @@ class PageExplorer:
                 }
                 for finding in finding_records
             ],
+            "contract_findings": contract_findings,
         }
 
     def _click_link(
@@ -570,7 +712,7 @@ class PageExplorer:
         def on_page(new_page):
             if new_page is not page:
                 popups.append(new_page)
-                popup_logs.append(EventLog(new_page, self.redactor))
+                popup_logs.append(self._event_log(new_page))
 
         context.on("page", on_page)
         try:
@@ -621,6 +763,165 @@ class PageExplorer:
                 self.redactor.redact_text(f"子页面加载验证截图失败：{final_url}；{exc}"),
             )
             return None
+
+    def _schedule_sampled_destination(
+        self,
+        page_row: dict,
+        row: dict,
+        destination: str,
+        path: list,
+        *,
+        same_depth: bool,
+    ) -> tuple[int | None, bool]:
+        depth = int(page_row["depth"]) if same_depth else int(page_row["depth"]) + 1
+        if not same_depth and depth > int(self.scope["max_page_depth"]):
+            return None, False
+        if self._page_count() >= int(self.settings["max_pages"]):
+            self.storage.add_message(
+                self.run_id,
+                "warning",
+                "coverage",
+                f"页面数量达到上限 {self.settings['max_pages']}，未调度采样页 {destination}",
+            )
+            return None, False
+        return self.storage.add_page(
+            self.run_id,
+            destination,
+            depth,
+            path,
+            int(page_row["id"]),
+            int(row["control_id"]),
+        )
+
+    def _handle_sampled_link(
+        self,
+        page,
+        context,
+        page_row: dict,
+        row: dict,
+        locator,
+        log: EventLog,
+        *,
+        pagination: bool,
+    ) -> None:
+        descriptor = row["descriptor"]
+        target = canonical_url(self.target, descriptor["href"])
+        reserved, visit = self.storage.reserve_link(
+            self.run_id,
+            target,
+            int(page_row["id"]),
+            int(row["state_id"]),
+            int(row["control_id"]),
+            row["full_path"],
+        )
+        action_type = "pagination_sample" if pagination else "list_item_sample"
+        if not reserved:
+            outcome = f"该采样目标此前已处理（{visit['status']}），本次不重复点击"
+            self.storage.add_edge(
+                self.run_id,
+                int(page_row["id"]),
+                int(row["state_id"]),
+                int(row["control_id"]),
+                target,
+                "DUPLICATE_LINK",
+                row["full_path"],
+                duplicate_visit_id=int(visit["id"]),
+            )
+            self._record_action(
+                row,
+                "DUPLICATE_LINK",
+                action_type,
+                outcome,
+                sampling_group_key=descriptor.get("sampling_group_key"),
+                sampling_position=descriptor.get("sampling_position"),
+            )
+            self.storage.finish_frontier(int(row["id"]), "DUPLICATE_LINK", {"target": target})
+            return
+
+        destination_page, result = self._click_link(
+            page, context, locator, descriptor, log, int(page_row["id"])
+        )
+        final_url = canonical_url(self.target, result["final_url"])
+        screenshot_path = self._capture_link_proof(destination_page, page_row, row, final_url)
+        result["screenshot_path"] = screenshot_path
+        if not screenshot_path:
+            result["loaded"] = False
+            result.setdefault("load_check_reasons", []).append("未能保存采样页面加载证明截图")
+        evidence = log.evidence() | result | {
+            "sampling_group_key": descriptor.get("sampling_group_key"),
+            "sampling_position": descriptor.get("sampling_position"),
+            "sample_kind": "PAGINATION" if pagination else "LIST_ITEM",
+        }
+        target_page_id = None
+        if not same_host(self.target, final_url):
+            status = "OUT_OF_SCOPE"
+            outcome = f"采样点击后跳转到外域 {final_url}，不继续"
+            self.storage.finish_link(int(visit["id"]), status, **result)
+        elif result["loaded"]:
+            status = "PAGINATION_SAMPLE_PASS" if pagination else "LIST_SAMPLE_PASS"
+            sample_name = "分页代表页" if pagination else "列表代表项目"
+            outcome = (
+                f"已真实点击并验证{sample_name}加载正常：{final_url}；"
+                f"HTTP {result.get('http_status') if result.get('http_status') is not None else '未捕获'}，"
+                f"标题「{result.get('title') or '无标题'}」，正文 {result.get('body_chars')} 字符"
+            )
+            self.storage.finish_link(int(visit["id"]), "CONFIRMED", **result)
+            arrival = list(row["full_path"]) + [
+                {"label": f"采样到达：{result.get('title') or final_url}", "url": final_url}
+            ]
+            target_page_id, _ = self._schedule_sampled_destination(
+                page_row,
+                row,
+                final_url,
+                arrival,
+                same_depth=pagination,
+            )
+        else:
+            status = "UNCONFIRMED"
+            reasons = "；".join(result.get("load_check_reasons") or ["未知加载校验原因"])
+            outcome = f"采样链接已真实点击，但目标页面加载未确认：{final_url}；{reasons}"
+            link_status = (
+                "RETRY"
+                if int(row["attempts"]) < int(self.settings["retry_limit"])
+                else "UNCONFIRMED"
+            )
+            self.storage.finish_link(int(visit["id"]), link_status, error=outcome, **result)
+        self.storage.add_edge(
+            self.run_id,
+            int(page_row["id"]),
+            int(row["state_id"]),
+            int(row["control_id"]),
+            final_url,
+            status,
+            row["full_path"],
+            target_page_id=target_page_id,
+        )
+        action_id = self._record_action(row, status, action_type, outcome, evidence=evidence)
+        if screenshot_path:
+            self.storage.add_artifact(
+                self.run_id,
+                "sampled_link_load_proof",
+                screenshot_path,
+                page_id=int(page_row["id"]),
+                action_id=action_id,
+                metadata={
+                    "source_url": page_row["url"],
+                    "target_url": final_url,
+                    "sample_kind": "PAGINATION" if pagination else "LIST_ITEM",
+                    "loaded": result.get("loaded"),
+                },
+            )
+        if status == "UNCONFIRMED":
+            self.storage.retry_frontier(
+                int(row["id"]), evidence | {"outcome": outcome}, int(self.settings["retry_limit"])
+            )
+        else:
+            self.storage.finish_frontier(int(row["id"]), status, evidence)
+        if destination_page is not page:
+            try:
+                destination_page.close()
+            except Exception:
+                pass
 
     def _handle_known_link(self, page, context, page_row: dict, row: dict, locator, log: EventLog) -> None:
         descriptor = row["descriptor"]
@@ -797,24 +1098,132 @@ class PageExplorer:
             except Exception:
                 pass
 
-    def _handle_form_control(self, row: dict) -> None:
+    def _handle_form_control(self, page, row: dict, locator) -> None:
         descriptor = row["descriptor"]
         cases = plan_field_cases(descriptor, self.config.get("test_data", {}).get("prefix") or "webqa-run-")
         if cases:
-            self.storage.add_test_cases(
+            inserted = self.storage.add_test_cases(
                 self.run_id,
                 int(row["page_id"]),
                 int(row["state_id"]),
                 int(row["control_id"]),
                 cases,
             )
-            outcome = f"已根据 HTML 约束生成 {len(cases)} 个非提交型表单用例；提交动作受风险策略控制"
-            status = "FORM_PLANNED"
+            form_settings = (self.config.get("testing") or {}).get("form_execution") or {}
+            profile = str((self.config.get("testing") or {}).get("profile") or "full")
+            profile_settings = ((self.config.get("testing") or {}).get("profiles") or {}).get(profile) or {}
+            allowed_types = profile_settings.get("form_case_types", "all")
+            planned = self.storage.planned_test_cases(int(row["control_id"]))
+            if allowed_types != "all":
+                allowed = {str(value) for value in allowed_types or []}
+                planned = [item for item in planned if item["case_type"] in allowed]
+            if not form_settings.get("enabled", True):
+                outcome = f"已生成 {len(cases)} 个非提交型表单用例；当前配置只规划不执行"
+                status = "FORM_PLANNED"
+                executed: list[dict] = []
+            else:
+                original = locator.evaluate(
+                    """el => ({value: 'value' in el ? el.value : '', checked: 'checked' in el ? !!el.checked : null})"""
+                )
+                executed = []
+                tag = str(descriptor.get("tag") or "").lower()
+                field_type = str(descriptor.get("type") or tag).lower()
+                invalid_cases = {
+                    "empty",
+                    "invalid_format",
+                    "below_min",
+                    "above_max",
+                    "over_maxlength",
+                    "below_minlength",
+                    "pattern_mismatch",
+                }
+                for case in planned:
+                    value = json_load(case.get("input_json"), {}).get("value")
+                    result: dict = {"value": value, "case_type": case["case_type"]}
+                    case_status = "UNCONFIRMED"
+                    try:
+                        if field_type in {"checkbox", "radio"}:
+                            locator.set_checked(bool(value), timeout=int(self.settings["action_timeout_ms"]))
+                        elif tag == "select":
+                            locator.select_option(str(value), timeout=int(self.settings["action_timeout_ms"]))
+                        else:
+                            locator.fill(str(value if value is not None else ""), timeout=int(self.settings["action_timeout_ms"]))
+                        locator.evaluate("el => { el.dispatchEvent(new Event('change', {bubbles:true})); el.blur(); }")
+                        page.wait_for_timeout(80)
+                        validity = locator.evaluate(
+                            """el => ({
+                              valid: typeof el.checkValidity === 'function' ? el.checkValidity() : true,
+                              message: el.validationMessage || '',
+                              value: 'value' in el ? el.value : '',
+                              checked: 'checked' in el ? !!el.checked : null
+                            })"""
+                        )
+                        expected_valid = case["case_type"] not in invalid_cases
+                        if case["case_type"] == "valid" and (descriptor.get("constraints") or {}).get("pattern"):
+                            case_status = "PASS" if validity["valid"] else "UNCONFIRMED"
+                        elif case["case_type"] == "over_maxlength":
+                            maximum = int((descriptor.get("constraints") or {}).get("maxlength") or 0)
+                            case_status = "PASS" if (not validity["valid"] or len(validity["value"]) <= maximum) else "FAIL"
+                        else:
+                            case_status = "PASS" if bool(validity["valid"]) == expected_valid else "FAIL"
+                        result.update(
+                            {
+                                "expected_valid": expected_valid,
+                                "validity": validity,
+                                "input_retained": (
+                                    validity.get("checked") == bool(value)
+                                    if field_type in {"checkbox", "radio"}
+                                    else str(validity.get("value") or "") == str(value or "")
+                                ),
+                            }
+                        )
+                    except Exception as exc:
+                        result["error"] = self.redactor.redact_text(f"{type(exc).__name__}: {exc}")
+                    finally:
+                        if form_settings.get("restore_original_value", True):
+                            try:
+                                if field_type in {"checkbox", "radio"}:
+                                    locator.set_checked(bool(original.get("checked")))
+                                elif tag == "select":
+                                    locator.select_option(str(original.get("value") or ""))
+                                else:
+                                    locator.fill(str(original.get("value") or ""))
+                            except Exception as exc:
+                                result["restore_error"] = self.redactor.redact_text(str(exc))
+                    self.storage.finish_test_case(int(case["id"]), case_status, self.redactor.redact_value(result))
+                    executed.append({"id": case["id"], "status": case_status, **result})
+                failed = sum(1 for item in executed if item["status"] == "FAIL")
+                uncertain = sum(1 for item in executed if item["status"] == "UNCONFIRMED")
+                if failed:
+                    status = "FORM_CONTRACT_FAILED"
+                elif uncertain:
+                    status = "FORM_EXECUTED_WITH_WARNINGS"
+                else:
+                    status = "FORM_EXECUTED"
+                outcome = (
+                    f"已安全执行 {len(executed)} 个非提交型表单用例："
+                    f"通过 {len(executed) - failed - uncertain}，失败 {failed}，未确认 {uncertain}；"
+                    "原值已恢复，未触发表单提交"
+                )
         else:
             outcome = "该输入控件缺少可安全自动生成的数据，记录为业务规则未确认"
             status = "NEEDS_SPEC"
-        self._record_action(row, status, "form_field", outcome, planned_cases=cases)
-        self.storage.finish_frontier(int(row["id"]), status, {"planned_cases": len(cases)})
+            inserted = 0
+            executed = []
+        self._record_action(
+            row,
+            status,
+            "form_field",
+            outcome,
+            planned_cases=cases,
+            inserted_cases=inserted,
+            executed_cases=executed,
+        )
+        self.storage.finish_frontier(
+            int(row["id"]),
+            status,
+            {"planned_cases": len(cases), "executed_cases": len(executed), "outcome": outcome},
+        )
 
     @staticmethod
     def _error_signature(value: str) -> str:
@@ -1124,8 +1533,138 @@ class PageExplorer:
             )
         return results
 
+    def _run_invariant_check(
+        self,
+        page,
+        row: dict,
+        locator,
+        before: dict,
+        after: dict,
+        before_collection: dict,
+        after_collection: dict,
+        before_structure: dict,
+        after_structure: dict,
+        action_id: int,
+    ) -> None:
+        testing = self.config.get("testing") or {}
+        profile = str(testing.get("profile") or "full")
+        profile_settings = (testing.get("profiles") or {}).get(profile) or {}
+        settings = testing.get("invariants") or {}
+        if not settings.get("enabled", True) or not profile_settings.get("run_invariants", True):
+            return
+        invariant = select_invariant(row["descriptor"], settings)
+        if not invariant:
+            return
+        invariant_type = invariant["type"]
+        before_count = int(before_collection.get("count") or 0)
+        after_count = int(after_collection.get("count") or 0)
+        status = "UNCONFIRMED"
+        title = "控件不变量检查"
+        expected = ""
+        actual = ""
+        evidence: dict = {
+            "before_fingerprint": before.get("fingerprint"),
+            "after_fingerprint": after.get("fingerprint"),
+            "before_count": before_count,
+            "after_count": after_count,
+            "before_member_hashes": before_collection.get("member_hashes") or [],
+            "after_member_hashes": after_collection.get("member_hashes") or [],
+            "before_structure": before_structure,
+            "after_structure": after_structure,
+        }
+        try:
+            if invariant_type == "non_decreasing_count":
+                title = "加载更多后集合数量不应减少"
+                expected = f"动作后数量 >= {before_count}"
+                actual = f"动作后数量 {after_count}"
+                status = "PASS" if after_count >= before_count else "FAIL"
+            elif invariant_type == "non_increasing_count":
+                title = "筛选后集合数量不应增加"
+                expected = f"动作后数量 <= {before_count}"
+                actual = f"动作后数量 {after_count}"
+                status = "PASS" if before_count > 0 and after_count <= before_count else "UNCONFIRMED"
+                if before_count > 0 and after_count > before_count:
+                    status = "FAIL"
+            elif invariant_type == "same_collection_members":
+                title = "排序前后集合成员应保持不变"
+                expected = "排序只改变顺序，不增加、删除或替换集合成员"
+                actual = f"动作前 {before_count} 项，动作后 {after_count} 项"
+                if before_count == 0 and after_count == 0:
+                    status = "UNCONFIRMED"
+                else:
+                    status = (
+                        "PASS"
+                        if before_collection.get("member_hashes") == after_collection.get("member_hashes")
+                        else "FAIL"
+                    )
+            elif invariant_type == "stable_structure":
+                title = "切换语言后页面业务结构应保持稳定"
+                expected = "语言切换可改变文案，但关键区域、控件、表单和表格数量关系应保持"
+                actual = f"动作前 {before_structure}；动作后 {after_structure}"
+                status = "PASS" if before_structure == after_structure else "FAIL"
+            elif invariant_type in {"idempotent", "reversible"}:
+                if self._current_risk and self._current_risk.level in {"STATEFUL", "DESTRUCTIVE"}:
+                    expected = "只对无持久化副作用的动作执行二次验证"
+                    actual = f"风险等级 {self._current_risk.level}，已跳过"
+                    status = "SKIPPED_RISK"
+                else:
+                    locator.scroll_into_view_if_needed(timeout=2500)
+                    locator.click(timeout=int(self.settings["action_timeout_ms"]))
+                    self._settle(page)
+                    after_second, _ = self._snapshot(page)
+                    evidence["after_second_fingerprint"] = after_second.get("fingerprint")
+                    if invariant_type == "idempotent":
+                        title = "重复执行应保持相同结果"
+                        expected = f"第二次执行后状态仍为 {after.get('fingerprint')}"
+                        actual = f"第二次执行后状态为 {after_second.get('fingerprint')}"
+                        status = (
+                            "PASS"
+                            if after_second.get("fingerprint") == after.get("fingerprint")
+                            else "FAIL"
+                        )
+                    else:
+                        title = "可逆控件执行两次应恢复原状态"
+                        expected = f"第二次执行后恢复为 {before.get('fingerprint')}"
+                        actual = f"第二次执行后状态为 {after_second.get('fingerprint')}"
+                        status = (
+                            "PASS"
+                            if after_second.get("fingerprint") == before.get("fingerprint")
+                            else "FAIL"
+                        )
+            else:
+                expected = (
+                    "支持 idempotent/reversible/non_decreasing_count/non_increasing_count/"
+                    "same_collection_members/stable_structure"
+                )
+                actual = f"未知不变量类型 {invariant_type}"
+        except Exception as exc:
+            actual = self.redactor.redact_text(f"{type(exc).__name__}: {exc}")
+            evidence["error"] = actual
+        self.storage.add_invariant_result(
+            self.run_id,
+            int(row["page_id"]),
+            invariant_type,
+            invariant["source"],
+            invariant["confidence"],
+            status,
+            title,
+            expected,
+            actual,
+            self.redactor.redact_value(evidence),
+            action_id=action_id,
+            control_id=int(row["control_id"]),
+        )
+
     def _handle_state_action(self, browser, page, context, page_row: dict, row: dict, locator, log: EventLog) -> None:
         before, _ = self._snapshot(page)
+        try:
+            before_collection = visible_collection_snapshot(page)
+        except Exception:
+            before_collection = {"count": 0, "ordered_hashes": [], "member_hashes": []}
+        try:
+            before_structure = page_structure_profile(page)
+        except Exception:
+            before_structure = {}
         clipboard_before = ""
         try:
             clipboard_before = page.evaluate("navigator.clipboard.readText().catch(() => '')") or ""
@@ -1135,6 +1674,14 @@ class PageExplorer:
         self._attempt_click(locator)
         self._settle(page)
         after, _ = self._snapshot(page)
+        try:
+            after_collection = visible_collection_snapshot(page)
+        except Exception:
+            after_collection = {"count": 0, "ordered_hashes": [], "member_hashes": []}
+        try:
+            after_structure = page_structure_profile(page)
+        except Exception:
+            after_structure = {}
         clipboard_after = ""
         try:
             clipboard_after = page.evaluate("navigator.clipboard.readText().catch(() => '')") or ""
@@ -1335,6 +1882,18 @@ class PageExplorer:
                 action_path=next_path,
                 action_id=final_action_id,
             )
+        self._run_invariant_check(
+            page,
+            row,
+            locator,
+            before,
+            after,
+            before_collection,
+            after_collection,
+            before_structure,
+            after_structure,
+            final_action_id,
+        )
 
     def _observe_after_failure(self, page, row: dict) -> dict:
         observation = {"available": False, "state_changed": False}
@@ -1447,6 +2006,21 @@ class PageExplorer:
                     )
                     self.storage.finish_frontier(int(row["id"]), "OUT_OF_SCOPE", {"target": href})
                     return
+                if descriptor.get("pagination_sample"):
+                    stage = "action"
+                    self._handle_sampled_link(
+                        page, context, page_row, row, locator, log, pagination=True
+                    )
+                    return
+                if (
+                    descriptor.get("list_item_sample")
+                    and self.list_sampling_settings.get("open_sampled_items", True)
+                ):
+                    stage = "action"
+                    self._handle_sampled_link(
+                        page, context, page_row, row, locator, log, pagination=False
+                    )
+                    return
                 if canonical_url(self.target, href) != canonical_url(self.target, page_row["canonical_url"]):
                     stage = "action"
                     self._handle_known_link(page, context, page_row, row, locator, log)
@@ -1454,10 +2028,10 @@ class PageExplorer:
             tag = descriptor.get("tag")
             field_type = (descriptor.get("type") or "").lower()
             if tag in {"textarea", "select"} or (
-                tag == "input" and field_type not in {"button", "submit", "reset", "checkbox", "radio"}
+                tag == "input" and field_type not in {"button", "submit", "reset"}
             ):
                 stage = "plan"
-                self._handle_form_control(row)
+                self._handle_form_control(page, row, locator)
                 return
             stage = "action"
             self._handle_state_action(browser, page, context, page_row, row, locator, log)
@@ -1572,6 +2146,11 @@ class PageExplorer:
         )
         if self.pagepatrol_enabled:
             patrol = run_pagepatrol(self.config, self.output_dir, page_row["url"], page_id)
+            patrol_metadata = {
+                key: value
+                for key, value in patrol.items()
+                if key not in {"findings", "imported_findings"}
+            }
             for key in ("report_json", "report_html"):
                 if patrol.get(key):
                     self.storage.add_artifact(
@@ -1579,8 +2158,17 @@ class PageExplorer:
                         f"pagepatrol_{key.split('_')[-1]}",
                         patrol[key],
                         page_id=page_id,
-                        metadata=patrol,
+                        metadata=patrol_metadata,
                     )
+            imported_findings = patrol.get("imported_findings") or []
+            if imported_findings:
+                self.storage.add_external_findings(
+                    self.run_id,
+                    page_id,
+                    "PagePatrol",
+                    self.redactor.redact_value(imported_findings),
+                    patrol.get("report_html") or patrol.get("report_json"),
+                )
             if patrol.get("status") not in {"DONE", "DISABLED"}:
                 self.storage.add_message(
                     self.run_id,

@@ -35,9 +35,70 @@ semantic:
   failure_patterns: []
   empty_state_patterns: []
 
+testing:
+  # 启动脚本会询问：smoke 快速验证，full 全量探索与全部安全用例。
+  profile: full
+  profiles:
+    smoke:
+      traversal:
+        max_pages: 40
+        max_states_per_page: 8
+        max_controls_per_state: 120
+        max_actions_per_page: 80
+      form_case_types: [valid]
+      run_business_flows: true
+      run_invariants: true
+      list_item_samples: 1
+      pagination_samples: 3
+    full:
+      traversal: {}
+      form_case_types: all
+      run_business_flows: true
+      run_invariants: true
+      list_item_samples: 2
+      pagination_samples: 3
+  form_execution:
+    enabled: true
+    restore_original_value: true
+  invariants:
+    enabled: true
+    auto_detect: true
+    # 可按控件标签显式声明 idempotent/reversible/non_decreasing_count/
+    # non_increasing_count/same_collection_members/stable_structure。
+    rules: []
+  list_sampling:
+    enabled: true
+    # 同一重复结构达到此数量后按列表处理；冒烟取 1 个详情，全量取头尾 2 个。
+    min_repeated_items: 6
+    item_detail_samples: 2
+    pagination_samples: 3
+    # 样本详情会真实点击并验证加载；其余重复项只计入覆盖总账。
+    open_sampled_items: true
+
+contracts:
+  api:
+    enabled: true
+    automatic_http_errors: true
+    capture_json_bytes: 262144
+    # 规则支持 page_url_regex、url_regex、methods、statuses、content_types、json_schema、
+    # required_fields、enums 和 required。
+    rules: []
+  ui:
+    enabled: true
+    automatic_title: true
+    automatic_accessible_names: true
+    # 规则支持 path_regex、title_regex、required_roles、required_selectors、
+    # required_text、forbidden_text 和 required_regions。
+    rules: []
+
+# Given/When/Then 业务流程。默认只允许只读动作；持久化流程需要双重显式授权。
+business_flows: []
+
 accounts:
   mode: guest
   storage_state: null
+  # 多角色业务流程可分别指定 Playwright storage_state。
+  roles: {}
 
 test_data:
   prefix: webqa-run-
@@ -115,6 +176,8 @@ pagepatrol:
   viewport: desktop
   open_report: true
   timeout_seconds: 180
+  # 总报告只导入明显缺陷；正常、warning 和 info 仍保留在 PagePatrol 原报告。
+  import_severities: [error]
 
 output:
   directory: webqa-output

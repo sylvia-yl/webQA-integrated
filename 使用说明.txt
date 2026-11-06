@@ -5,12 +5,12 @@ WebQA 使用说明
 
 首次运行先在 PowerShell 中执行：
 
-cd D:\ThreeProjects\webQA-integrated
+cd D:\ThreeProjects\webQA-integrated-20261106-new
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
 
-之后双击：D:\ThreeProjects\webQA-integrated\启动WebQA.cmd
+之后双击：D:\ThreeProjects\webQA-integrated-20261106-new\启动WebQA.cmd
 
 按照窗口提示输入：
 
@@ -19,7 +19,10 @@ python -m venv .venv
    - 0：只测试输入的网址，不进入子页面。
    - 1：测试输入网址和第一层子页面；如果深度 0 已跑完，可接续原结果只跑第一层。
    - 2：继续测试第二层子页面；已经完成的第 0、1 层不会重跑。
-3. 运行方式：
+3. 测试模式：
+   - S：冒烟测试。限制页面/状态/动作数量，只执行合法表单输入和关键只读检查。
+   - F：全量测试（默认）。执行全部安全探索、合法/空值/边界/无效表单用例和不变量检查。
+4. 运行方式：
    - N：新建一次独立测试。
    - R：接续该网址最近实例。既可以恢复暂停，也可以提高层数继续跑。
 
@@ -37,7 +40,7 @@ python -m venv .venv
 
 运行窗口会持续显示当前层、页面数、状态数、控件队列、链接数和最新动作。
 
-也可以双击：D:\ThreeProjects\webQA-integrated\查看WebQA状态.cmd
+也可以双击：D:\ThreeProjects\webQA-integrated-20261106-new\查看WebQA状态.cmd
 
 直接按 Enter 查看最近实例；也可以输入指定的运行 ID。
 
@@ -50,7 +53,7 @@ python -m venv .venv
 
 每次测试单独归档到：
 
-D:\ThreeProjects\webQA-integrated\webqa-output\runs\<开始时间-实例ID>\
+D:\ThreeProjects\webQA-integrated-20261106-new\webqa-output\runs\<开始时间-实例ID>\
 
 主要文件：
 
@@ -62,12 +65,16 @@ D:\ThreeProjects\webQA-integrated\webqa-output\runs\<开始时间-实例ID>\
 - screenshots：页面状态截图。
 - traces：缺陷复现轨迹；默认关闭，只有显式启用 `safety.capture_traces` 才生成。
 - pagepatrol：PagePatrol 原始报告。
+- PagePatrol 的正常、info、warning 只保留在原报告；默认只有 severity=error 的明显缺陷汇总到 WebQA 总报告。
+- API/UI 契约、表单边界值、幂等/可逆/蜕变关系和 Given/When/Then 业务流程结果会进入总报告。
+- 重复列表默认采用代表性采样：冒烟打开 1 个项目，全量打开首页首项和末页末项；分页真实验证首页、中间代表页和末页，其余项目只计数、不逐项点击。
 - semantic-reproductions：高可信内容语义异常的两次独立复现截图。
 
 四、刚才的网址如何测试主页
 
 网址输入：https://staging.evomap.work/zh
 层数输入：0
+测试模式输入：F
 运行方式输入：N
 
 这会完整测试 /zh 页面本身的可见控件和页面内状态，但不会进入任何子页面。
@@ -84,6 +91,18 @@ D:\ThreeProjects\webQA-integrated\webqa-output\runs\<开始时间-实例ID>\
 - 动作已经触发但结果不确定时标记为 UNKNOWN_COMMIT，不自动重试。
 - 页眉、页脚、全局导航及悬浮控件首次成功测试后，在同一次运行的其他页面只做可见性、可用性和实时指纹核验；一致时记录 SHARED_CONTROL_REUSED，不再次点击。
 - 页面业务区、表单提交、失败或未确认的控件不会复用；新建回归实例会全部重新测试。
+- 列表采样与共享控件去重不同：列表仍会记录可见项、样本和跳过数量；分页样本保持在原层级，项目详情才属于下一层。
 - 每个页面及动作后的新状态都会进行语义检查；HTTP 200 不会被直接视为内容正常。
 - 明确的内容不可用、数据缺失和持续加载会独立复现；主观或低可信文案问题只列为待确认。
 - 语义模型默认未配置，报告会明确显示 DETERMINISTIC_ONLY；如启用模型但适配器不可用，会记录 SEMANTIC_CHECK_UNAVAILABLE，而不是静默通过。
+
+六、无人值守能力和配置边界
+
+- 页面遍历、API/UI 契约、非提交型表单等价类/边界值、幂等/可逆/蜕变检查、只读业务流程、PagePatrol 汇总和报告生成均可无人值守执行。
+- API/UI 契约和业务流程不是靠猜测业务真值；应先在 webqa.yaml 中配置规则。未配置时仍会执行通用 HTTP 错误、页面标题、可访问名称和语义检查。
+- 登录角色需要预先提供 storage_state；系统不会自动索取或填写真实密码。
+- 保存、提交、发送等持久化动作必须同时设置流程 authorized_stateful: true 和全局 safety.allow_stateful_actions: true。
+- 删除、支付、发布等破坏性动作默认禁止，不会为了“零人工”而自动放开。
+- 同一实例续跑必须保持 S/F 模式不变；从冒烟升级到全量请选 N 新建实例，否则已完成页面无法补齐全量用例。
+
+详细 YAML 示例见 WEBQA工作流.md 的“测试模式与自动测试策略”章节。

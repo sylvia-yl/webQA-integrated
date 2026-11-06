@@ -2,7 +2,7 @@
 
 ## 独立启动
 
-双击 `启动WebQA.cmd`，依次输入完整网址和允许进入的子页面层数即可。启动窗口会持续显示轮次、当前层、页面、状态节点、控件队列、链接数量和最新动作。若输入层数 `0`，只测试输入的网址本身，不进入子页面。
+双击 `启动WebQA.cmd`，依次输入完整网址、允许进入的子页面层数、冒烟/全量模式和新建/续跑方式。启动窗口会持续显示轮次、当前层、页面、状态节点、控件队列、链接数量和最新动作。若输入层数 `0`，只测试输入的网址本身，不进入子页面。
 
 运行期间也可以双击 `查看WebQA状态.cmd`，在另一个窗口查看最近实例或指定运行 ID。每次运行目录中的 `live-status.json` 和 `live-status.md` 会持续更新。
 
@@ -24,6 +24,161 @@
 12. 截图默认遮盖表单字段；URL、日志、报告和 PagePatrol 文本结果默认脱敏；Playwright trace 默认关闭。
 13. 起始页、子页面、动态跳转页及动作后的页面状态都必须经过统一语义观察；HTTP 200 不等于内容正确。
 14. 高可信内容异常在两个全新 BrowserContext 中复现后才确认为缺陷；低可信文案问题只进入人工确认。
+15. PagePatrol 始终保留独立原报告；默认只有 `severity=error` 的明显缺陷进入 WebQA 总报告，正常、info 和 warning 不重复汇报。
+
+## 测试模式与自动测试策略
+
+- `smoke`：快速验证关键页面。默认最多 40 个页面、每页 8 个状态、每状态 120 个控件、每页 80 个动作；表单只执行合法值。
+- `full`：全量执行当前深度内的安全探索，并运行合法、空值、边界和无效输入用例。
+- 两种模式都会运行已配置的 API/UI 契约、只读业务流程和安全不变量检查。
+- 同一运行 ID 的模式不可切换。模式会影响已经完成页面的覆盖；从 smoke 升级到 full 必须使用 `--new-run` 新建回归实例。
+
+命令行也可直接选择：
+
+```powershell
+python .\webqa_cli.py run --profile smoke --new-run
+python .\webqa_cli.py run --profile full --new-run
+```
+
+### API 契约
+
+系统采集同页 XHR/fetch 响应，在统一脱敏后检查状态码、Content-Type、JSON Schema、必填字段和枚举值。JSON 正文默认最多采集 256 KiB。
+
+```yaml
+contracts:
+  api:
+    enabled: true
+    automatic_http_errors: true
+    capture_json_bytes: 262144
+    rules:
+      - key: leaderboard-api
+        page_url_regex: /leaderboard
+        url_regex: /api/leaderboard
+        methods: [GET]
+        statuses: [200]
+        content_types: [application/json]
+        required_fields: [data, data.*.id, data.*.status]
+        enums:
+          data.*.status: [active, inactive]
+        json_schema:
+          type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+        required: true
+        severity: major
+```
+
+`page_url_regex` 用来限定“哪些页面必须调用此接口”，避免把某个业务页的必需接口错误套用到全站。`required: true` 默认只在匹配页面的初始观察阶段要求接口必须出现；可用 `phases` 显式限制到 `INITIAL_PAGE`、`STATE_AFTER_ACTION` 等阶段。没有业务契约时，`automatic_http_errors` 仍会记录 XHR/fetch 的 4xx/5xx。
+
+### UI 契约
+
+通用检查会发现空标题和无可访问名称的可见交互控件。显式规则支持标题、selector、ARIA role、文案和业务区域：
+
+```yaml
+contracts:
+  ui:
+    enabled: true
+    automatic_title: true
+    automatic_accessible_names: true
+    rules:
+      - key: leaderboard-ui
+        path_regex: /leaderboard
+        title_regex: 排行榜|Leaderboard
+        required_roles:
+          - {role: heading, name: 排行榜}
+        required_selectors: [main]
+        required_regions: ['main table, main [role="grid"]']
+        forbidden_text: [Internal Server Error]
+        severity: major
+```
+
+### Given/When/Then 业务流程
+
+流程在隔离 BrowserContext 中运行，支持 `open/assert/wait_ms/click/fill/select/check/clear`。默认禁止 POST/PUT/PATCH/DELETE 副作用：
+
+```yaml
+business_flows:
+  - key: guest-search
+    title: 游客搜索
+    profiles: [smoke, full]
+    role: guest
+    given:
+      - open: /zh/search
+      - assert: {title_regex: 搜索}
+    when:
+      - fill: {selector: 'input[type="search"]', value: webqa}
+      - click: {role: button, name: 搜索}
+    then:
+      - assert: {selector: 'main [role="list"]'}
+      - assert: {not_text: Internal Server Error}
+    forbidden_side_effects: [POST, PUT, PATCH, DELETE]
+```
+
+非 guest 角色从 `accounts.roles.<role>.storage_state` 载入已录制会话。保存、提交、发送等持久化流程必须同时设置流程 `authorized_stateful: true` 和全局 `safety.allow_stateful_actions: true`；删除、支付和发布仍受破坏性策略与 `prohibited` 限制。
+
+### 表单、幂等、可逆与蜕变关系
+
+普通输入框会实际执行 `fill/select/check/clear` 级别的非提交用例，覆盖合法值、空值、min/max、minlength/maxlength、格式和 pattern；每个用例结束后恢复原值，不触发表单提交。
+
+系统会保守识别或按规则声明以下关系：
+
+- `idempotent`：同一安全动作执行两次，第二次状态与第一次一致；
+- `reversible`：主题、菜单等动作执行两次恢复原状态；
+- `non_decreasing_count`：加载更多后集合数量不减少；
+- `non_increasing_count`：筛选后集合数量不增加；
+- `same_collection_members`：排序前后成员集合不变，只允许顺序变化；
+- `stable_structure`：语言切换可改变文案，但关键页面结构计数保持稳定。
+
+```yaml
+testing:
+  invariants:
+    enabled: true
+    auto_detect: true
+    rules:
+      - label_regex: ^按时间排序$
+        type: same_collection_members
+        source: requirement:list-sort
+        confidence: high
+```
+
+自动推断只用于明显的 ARIA 状态和标签；不确定的业务关系应使用显式规则或 Given/When/Then 断言，避免把猜测当成缺陷。
+
+### 大列表与分页采样
+
+当 `table/tbody`、list、ARIA row/listitem、article 或 card 容器出现至少 6 个重复项目时，系统把它识别为列表，而不是把所有行内控件都加入执行队列：
+
+- 冒烟模式：默认真实点击并验证 1 个代表项目；
+- 全量模式：有分页时取首页首项和末页末项，共 2 个；无分页时取当前可见列表的首尾；
+- 每个被选项目只执行一个主入口，优先选择详情链接，避免同一行内多个重复按钮全部执行；
+- 分页页属于同一个业务层级，不占用子页面深度；项目详情仍属于下一层；
+- 分页链接会真实点击并进行加载、网络、语义和截图检查，默认选择可识别的首页、中间代表页和末页；
+- 如果分页只显示 `1、2、…、10`，系统仅在已验证 URL 明确使用 `page=数字` 或 `/page/数字` 时推导并直接检查第 5 页；不会用不可靠的字符串替换猜 URL；
+- 其余重复控件仍写入控件总账，但标记为采样跳过，不进入执行队列；最终报告显示可见项目数、执行样本和跳过数量。
+
+```yaml
+testing:
+  profiles:
+    smoke:
+      list_item_samples: 1
+      pagination_samples: 3
+    full:
+      list_item_samples: 2
+      pagination_samples: 3
+  list_sampling:
+    enabled: true
+    min_repeated_items: 6
+    item_detail_samples: 2
+    pagination_samples: 3
+    open_sampled_items: true
+```
+
+若站点只提供“下一页”，没有总页数、末页入口或可推导页码，系统不会猜测不存在的 URL；此时只验证页面明确暴露的安全分页入口，并在报告中保留实际覆盖范围。
+
+### 无人值守边界
+
+遍历、契约检查、非提交表单用例、只读业务流程、不变量验证、PagePatrol 缺陷导入和总报告生成可全程无人值守。业务 Oracle、角色会话和持久化动作授权仍需预先配置；系统不会自动索取密码，也不会自动放开保存、删除、支付或发布操作。语句通顺度等主观语义需要配置本地语义模型适配器；未配置时会明确标记为确定性规则覆盖，而不会伪装成模型已经判断。
 
 ## 页面理解与语义 Oracle
 
@@ -121,6 +276,10 @@ python .\webqa_cli.py run --max-depth 2 --parallel-pages 4
 # 开启一次独立回归测试；不复用上一次运行的链接点击历史
 python .\webqa_cli.py run --new-run
 
+# 选择冒烟或全量模式
+python .\webqa_cli.py run --profile smoke --new-run
+python .\webqa_cli.py run --profile full --new-run
+
 # 查看进度或重新生成报告
 python .\webqa_cli.py status
 python .\webqa_cli.py report
@@ -163,3 +322,5 @@ webqa-output/
 - 技术通过、风险跳过、表单规划、业务规则未确认、自动化未确认和阻塞项；
 - 页面类型、语义覆盖状态、Oracle 来源、预期/实际、置信度和双上下文复现结果；
 - PagePatrol 报告、截图以及完整点击历程。
+- API/UI 契约异常、PagePatrol 明显缺陷、表单边界异常、幂等/可逆/蜕变关系和 Given/When/Then 业务流程结果。
+- 大列表的可见项数量、首尾项目样本、分页头/中/尾样本及被采样跳过的重复控件数量。

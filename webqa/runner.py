@@ -6,6 +6,7 @@ import threading
 
 from .explorer import PageExplorer
 from .reporter import Reporter
+from .scenarios import ScenarioRunner
 from .storage import Storage
 
 
@@ -96,7 +97,20 @@ class LayeredRunner:
                 break
 
         remaining = self.storage.pending_depths(self.run_id, max_depth)
+        business_flows: list[dict] = []
         if not remaining:
+            business_flows = ScenarioRunner(
+                self.storage,
+                self.run_id,
+                self.config,
+                self.output_dir,
+            ).run_all()
             self.storage.set_run_status(self.run_id, "COMPLETED", current_depth=max_depth)
         Reporter(self.storage, self.run_id, self.config, self.output_dir).write()
-        return {"run_id": self.run_id, "layers": processed_layers, "remaining_depths": remaining}
+        return {
+            "run_id": self.run_id,
+            "profile": self.config.get("testing", {}).get("profile", "full"),
+            "layers": processed_layers,
+            "business_flows": business_flows,
+            "remaining_depths": remaining,
+        }

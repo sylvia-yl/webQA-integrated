@@ -207,7 +207,7 @@ class SemanticPersistenceTest(unittest.TestCase):
             self.assertGreater(rule_id, 0)
             self.assertGreater(evaluation_id, 0)
             self.assertEqual("SUSPECTED", findings[0]["status"])
-            self.assertEqual("4", storage.rows("SELECT value FROM schema_meta WHERE key='version'")[0]["value"])
+            self.assertEqual("6", storage.rows("SELECT value FROM schema_meta WHERE key='version'")[0]["value"])
             storage.close_thread_connection()
 
     def test_semantic_configuration_requires_the_stage_when_marked_required(self):

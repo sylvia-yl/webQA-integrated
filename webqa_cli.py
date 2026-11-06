@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from webqa.config import apply_overrides, load_config
+from webqa.config import apply_overrides, apply_test_profile, load_config
 from webqa.progress import ProgressTracker
 from webqa.reporter import Reporter
 from webqa.storage import Storage
@@ -53,6 +53,7 @@ def command_run(args) -> int:
         max_depth=args.max_depth,
         parallel_pages=args.parallel_pages,
     )
+    apply_test_profile(config, args.profile)
     if args.no_open:
         config["pagepatrol"]["open_report"] = False
     if args.no_pagepatrol:
@@ -62,7 +63,11 @@ def command_run(args) -> int:
     run_id, created = storage.create_or_resume_run(config, new_run=args.new_run)
     output_dir = run_output_dir(config, run_id)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[运行] {'新建' if created else '续跑'} {run_id}", flush=True)
+    print(
+        f"[运行] {'新建' if created else '续跑'} {run_id} · "
+        f"{config['testing']['profile'].upper()} 模式",
+        flush=True,
+    )
     round_info = storage.latest_round(run_id) or {}
     round_modes = {"NEW": "新建实例", "RESUME": "断点续跑", "EXPAND": "提高深度接续"}
     print(
@@ -136,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--one-layer", action="store_true", help="只处理当前最浅的一层，完成后停在可继续状态")
     run.add_argument("--max-depth", type=int, help="解锁到指定层；续跑时可递增但不可降低")
     run.add_argument("--parallel-pages", type=int, help="临时覆盖同层并行页面数（1-8）")
+    run.add_argument(
+        "--profile",
+        choices=["smoke", "full"],
+        help="测试模式：smoke 快速关键检查；full 全量探索与安全用例",
+    )
     run.add_argument("--headed", action="store_true", help="显示 Playwright 浏览器窗口")
     run.add_argument("--no-pagepatrol", action="store_true", help="本次不执行 PagePatrol")
     run.add_argument("--no-open", action="store_true", help="PagePatrol 完成后不自动打开子报告")

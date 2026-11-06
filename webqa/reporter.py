@@ -40,6 +40,12 @@ def _status_cn(value: str) -> str:
         "OUT_OF_SCOPE": "范围外",
         "SKIPPED_RISK": "风险跳过",
         "FORM_PLANNED": "已生成表单用例",
+        "FORM_EXECUTED": "表单用例通过",
+        "FORM_EXECUTED_WITH_WARNINGS": "表单用例有未确认项",
+        "FORM_CONTRACT_FAILED": "表单约束失败",
+        "LIST_SAMPLE_PASS": "列表样本通过",
+        "PAGINATION_SAMPLE_PASS": "分页样本通过",
+        "PAGINATION_INFERRED": "分页模式推导代表页",
         "NEEDS_SPEC": "业务规则未确认",
         "UNCONFIRMED": "自动化未确认",
         "MANUAL_REVIEW": "需要人工确认",
@@ -254,6 +260,26 @@ class Reporter:
                WHERE se.run_id=? GROUP BY sf.classification""",
             (self.run_id,),
         )
+        contract_failures = self.storage.scalar(
+            "SELECT COUNT(*) FROM contract_results WHERE run_id=? AND status='FAIL'",
+            (self.run_id,),
+        )
+        external_findings = self.storage.scalar(
+            "SELECT COUNT(*) FROM external_findings WHERE run_id=?", (self.run_id,)
+        )
+        invariant_failures = self.storage.scalar(
+            "SELECT COUNT(*) FROM invariant_results WHERE run_id=? AND status='FAIL'",
+            (self.run_id,),
+        )
+        business_flows = self.storage.rows(
+            "SELECT status,COUNT(*) n FROM business_flow_results WHERE run_id=? GROUP BY status",
+            (self.run_id,),
+        )
+        list_sampling = self.storage.rows(
+            """SELECT sample_kind,SUM(selected_count) selected,SUM(skipped_count) skipped
+               FROM list_sampling_results WHERE run_id=? GROUP BY sample_kind""",
+            (self.run_id,),
+        )
         return {
             "run": run,
             "pages": {row["status"]: row["n"] for row in pages},
@@ -269,6 +295,17 @@ class Reporter:
             "qa_transitions": self.storage.scalar(
                 "SELECT COUNT(*) FROM qa_state_transitions WHERE run_id=?", (self.run_id,)
             ),
+            "contract_failures": contract_failures,
+            "external_findings": external_findings,
+            "invariant_failures": invariant_failures,
+            "business_flows": {row["status"]: row["n"] for row in business_flows},
+            "list_sampling": {
+                row["sample_kind"]: {
+                    "selected": int(row["selected"] or 0),
+                    "skipped": int(row["skipped"] or 0),
+                }
+                for row in list_sampling
+            },
         }
 
     def _artifact_reference(self, artifact: dict) -> tuple[str | None, str]:
@@ -362,6 +399,44 @@ class Reporter:
         qa_transitions = self.storage.rows(
             "SELECT * FROM qa_state_transitions WHERE run_id=? ORDER BY id", (self.run_id,)
         )
+        contract_failures = self.storage.rows(
+            """SELECT cr.*,p.canonical_url FROM contract_results cr
+               JOIN page_nodes p ON p.id=cr.page_id
+               WHERE cr.run_id=? AND cr.status IN ('FAIL','UNCONFIRMED')
+               ORDER BY cr.page_id,cr.id""",
+            (self.run_id,),
+        )
+        external_findings = self.storage.rows(
+            """SELECT ef.*,p.canonical_url FROM external_findings ef
+               JOIN page_nodes p ON p.id=ef.page_id
+               WHERE ef.run_id=? ORDER BY ef.page_id,ef.id""",
+            (self.run_id,),
+        )
+        invariant_findings = self.storage.rows(
+            """SELECT ir.*,p.canonical_url,c.label control_label FROM invariant_results ir
+               JOIN page_nodes p ON p.id=ir.page_id
+               LEFT JOIN controls c ON c.id=ir.control_id
+               WHERE ir.run_id=? AND ir.status IN ('FAIL','UNCONFIRMED')
+               ORDER BY ir.page_id,ir.id""",
+            (self.run_id,),
+        )
+        business_flow_results = self.storage.rows(
+            "SELECT * FROM business_flow_results WHERE run_id=? ORDER BY id", (self.run_id,)
+        )
+        form_findings = self.storage.rows(
+            """SELECT tc.*,p.canonical_url,c.label control_label
+               FROM test_cases tc JOIN page_nodes p ON p.id=tc.page_id
+               LEFT JOIN controls c ON c.id=tc.control_id
+               WHERE tc.run_id=? AND tc.status IN ('FAIL','UNCONFIRMED')
+               ORDER BY tc.page_id,tc.id""",
+            (self.run_id,),
+        )
+        list_sampling = self.storage.rows(
+            """SELECT ls.*,p.canonical_url FROM list_sampling_results ls
+               JOIN page_nodes p ON p.id=ls.page_id
+               WHERE ls.run_id=? ORDER BY ls.page_id,ls.id""",
+            (self.run_id,),
+        )
         rounds = self.storage.rows(
             "SELECT * FROM run_rounds WHERE run_id=? ORDER BY round_no", (self.run_id,)
         )
@@ -379,6 +454,7 @@ class Reporter:
             [
                 f"- 运行 ID：`{self.run_id}`",
                 f"- 目标：{run['target']}",
+                f"- 测试模式：{str((run_config.get('testing') or {}).get('profile') or 'full').upper()}",
                 f"- 状态：{_status_cn(run['status'])}",
                 f"- 实例开始时间：{run['created_at']}",
                 f"- 实例最后更新时间：{run['updated_at']}",
@@ -405,6 +481,11 @@ class Reporter:
                 f"- 语义观察：{len(semantic_evaluations)} 次；语义发现：{len(semantic_findings)} 项；"
                 f"分类：{'；'.join(f'{k} {v}' for k,v in summary['semantic_findings'].items()) or '无'}",
                 f"- QA 状态转换：{len(qa_transitions)} 条；主链：理解需求 → Oracle → 前置条件 → 执行 → 观察 → 分类 → 复现 → 报告",
+                f"- 自动测试发现：契约 {len(contract_failures)}；PagePatrol 明显缺陷 {len(external_findings)}；"
+                f"表单 {len(form_findings)}；不变量 {len(invariant_findings)}；业务流程 {len(business_flow_results)}",
+                f"- 列表采样：已执行 {sum(int(item['selected_count']) for item in list_sampling)} 个代表控件；"
+                f"跳过 {sum(int(item['skipped_count']) for item in list_sampling)} 个重复控件；"
+                "分页按首页/中间/末页代表点验证",
                 f"- 页面状态分布：{'；'.join(f'{_status_cn(k)} {v}' for k,v in page_status.items()) or '无'}",
                 f"- 控件最终结果：{'；'.join(f'{_status_cn(k)} {v}' for k,v in action_status.items()) or '无'}",
                 "",
@@ -481,6 +562,128 @@ class Reporter:
                         f"{_md(finding['confidence'])} / {_md(finding['severity'])} | "
                         f"{_md(finding['oracle_source'])} | {_md(finding['expected'])} | {_md(finding['actual'])} |"
                     )
+        if contract_failures:
+            md.extend(
+                [
+                    "",
+                    "## API/UI 契约异常",
+                    "",
+                    "| 类型 | 页面 | 规则 | 严重度 | 问题 | 预期 | 实际 |",
+                    "|---|---|---|---|---|---|---|",
+                ]
+            )
+            for item in contract_failures:
+                md.append(
+                    f"| {_md(item['contract_type'])} | {_md(item['canonical_url'])} | "
+                    f"{_md(item['rule_key'])} | {_md(item['severity'])} | {_md(item['title'])} | "
+                    f"{_md(item['expected'])} | {_md(item['actual'])} |"
+                )
+        if list_sampling:
+            md.extend(
+                [
+                    "",
+                    "## 列表与分页采样",
+                    "",
+                    "重复列表不会逐项点击。冒烟模式默认打开 1 个代表项目，全量模式默认打开首页和末页各 1 个；分页验证首页、可识别的中间代表页和末页。",
+                    "",
+                    "| 页面 | 类型 | 策略 | 当前页/末页 | 可见项 | 执行 | 跳过重复控件 | 样本 |",
+                    "|---|---|---|---|---:|---:|---:|---|",
+                ]
+            )
+            for item in list_sampling:
+                context = json_load(item.get("page_context_json"), {})
+                selected = json_load(item.get("selected_json"), [])
+                samples = "；".join(
+                    str(value.get("label") or value.get("href") or value.get("page") or "-")
+                    for value in selected
+                ) or "-"
+                md.append(
+                    f"| {_md(item['canonical_url'])} | {_md(item['sample_kind'])} | "
+                    f"{_md(item['strategy'])} | {_md(context.get('current') or '-')} / "
+                    f"{_md(context.get('last') or '-')} | {item['visible_items']} | "
+                    f"{item['selected_count']} | {item['skipped_count']} | {_md(samples)} |"
+                )
+        if external_findings:
+            md.extend(
+                [
+                    "",
+                    "## PagePatrol 明显缺陷",
+                    "",
+                    "正常结果、warning 和 info 不在此汇总；完整信息仍保留在 PagePatrol 原报告。",
+                    "",
+                    "| 页面 | 检查 | 类别 | 严重度 | 问题 | 元素 | 原报告 |",
+                    "|---|---|---|---|---|---|---|",
+                ]
+            )
+            for item in external_findings:
+                report_label = "-"
+                if item.get("report_path"):
+                    report_file = Path(item["report_path"])
+                    try:
+                        relative = report_file.resolve().relative_to(self.output_dir.resolve())
+                        if report_file.exists():
+                            report_label = f"[打开]({relative.as_posix()})"
+                    except ValueError:
+                        pass
+                md.append(
+                    f"| {_md(item['canonical_url'])} | {_md(item['check_key'])} | "
+                    f"{_md(item['category'])} | {_md(item['severity'])} | {_md(item['title'])} | "
+                    f"{_md(item.get('selector') or '-')} | {report_label} |"
+                )
+        if form_findings:
+            md.extend(
+                [
+                    "",
+                    "## 等价类与边界值异常",
+                    "",
+                    "| 页面 | 字段 | 用例 | 状态 | 预期 | 实际 |",
+                    "|---|---|---|---|---|---|",
+                ]
+            )
+            for item in form_findings:
+                result = json_load(item.get("result_json"), {})
+                actual = result.get("error") or result.get("validity") or result
+                md.append(
+                    f"| {_md(item['canonical_url'])} | {_md(item.get('control_label') or item['control_id'])} | "
+                    f"{_md(item['case_type'])} | {_md(item['status'])} | {_md(item['expected'])} | {_md(actual)} |"
+                )
+        if invariant_findings:
+            md.extend(
+                [
+                    "",
+                    "## 幂等、可逆与蜕变关系异常",
+                    "",
+                    "| 页面 | 控件 | 关系 | 来源/可信度 | 状态 | 预期 | 实际 |",
+                    "|---|---|---|---|---|---|---|",
+                ]
+            )
+            for item in invariant_findings:
+                md.append(
+                    f"| {_md(item['canonical_url'])} | {_md(item.get('control_label') or '-')} | "
+                    f"{_md(item['invariant_type'])} | {_md(item['source'])} / {_md(item['confidence'])} | "
+                    f"{_md(item['status'])} | {_md(item['expected'])} | {_md(item['actual'])} |"
+                )
+        if business_flow_results:
+            md.extend(
+                [
+                    "",
+                    "## Given/When/Then 业务流程",
+                    "",
+                    "| 流程 | 角色 | 模式 | 状态 | 结果 |",
+                    "|---|---|---|---|---|",
+                ]
+            )
+            for item in business_flow_results:
+                result = json_load(item.get("result_json"), {})
+                failures = [
+                    step.get("error")
+                    for step in result.get("steps") or []
+                    if step.get("error")
+                ]
+                md.append(
+                    f"| {_md(item['title'])} | {_md(item['role'])} | {_md(item['profile'])} | "
+                    f"{_md(item['status'])} | {_md('；'.join(failures) if failures else '全部断言通过')} |"
+                )
         md.extend(
             [
                 "",
